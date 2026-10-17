@@ -101,13 +101,11 @@ endif()
 # --- warnings ---------------------------------------------------------------
 if(MSVC)
   set(SFCC_WARNINGS /W4 /permissive-)
-  # _CRT_SECURE_NO_WARNINGS silences the "use the _s variants" advice.
-  # _CRT_DECLARE_NONSTDC_NAMES is what makes <string.h> declare the POSIX
-  # spellings -- strncasecmp among them. MSVC has them but hides them by
-  # default, and there is no <strings.h> to fall back on, so without this the
-  # build stops at "Cannot open include file: 'strings.h'".
-  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_DECLARE_NONSTDC_NAMES
-                          UNICODE _UNICODE)
+  # _CRT_SECURE_NO_WARNINGS silences the "use the _s variants" advice. Nothing
+  # else is needed: the two POSIX spellings this code uses, strncasecmp and
+  # strdup, are wrapped in sfcc_strncasecmp and sfcc_strdup rather than borrowed
+  # from the CRT, which does not declare them under _CRT_DECLARE_NONSTDC_NAMES.
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
 else()
   set(SFCC_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wvla -Wcast-qual
                     -Wwrite-strings -Wformat=2 -Wundef)
@@ -124,7 +122,12 @@ endif()
 # third_party/cjson/README.md means the version is auditable.
 add_library(sfcc_cjson STATIC third_party/cjson/cJSON.c)
 target_include_directories(sfcc_cjson PUBLIC third_party/cjson)
-target_link_libraries(sfcc_cjson PUBLIC m)
+# libm only exists as a separate library on ELF and Mach-O platforms. On
+# Windows the math functions are part of the CRT, and asking for it fails the
+# link with "cannot open input file 'm.lib'".
+if(NOT MSVC)
+  target_link_libraries(sfcc_cjson PUBLIC m)
+endif()
 if(NOT MSVC)
   # cJSON is third-party code we do not control the style of; warning flags on
   # it produce noise that would drown out warnings about ours.

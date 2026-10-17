@@ -73,6 +73,15 @@ void  sfcc_buf_free(sfcc_buf* b);
 /* ------------------------------------------------------------------------ */
 
 char* sfcc_strdup(const char* s);          /* NULL in, NULL out              */
+
+/* Case-insensitive comparison over at most n bytes, for header names.
+ *
+ * POSIX calls this strncasecmp and declares it in <strings.h>. Windows has
+ * neither the header nor, despite _CRT_DECLARE_NONSTDC_NAMES, the POSIX
+ * spelling in <string.h>: the call compiles to an implicit extern declaration
+ * and MSVC reports C4013. _strnicmp is its documented equivalent. Wrapping it
+ * is the difference between a build and not. */
+int sfcc_strncasecmp(const char* a, const char* b, size_t n);
 void  sfcc_strfree(char** s);              /* NULL-safe free + null out       */
 void  sfcc_strset(char** slot, const char* value);
 int   sfcc_str_eq(const char* a, const char* b);

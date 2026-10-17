@@ -23,9 +23,6 @@
 
 #include <stdarg.h>
 #include <stdio.h>
-#ifndef _WIN32
-#include <strings.h>   /* strncasecmp; MSVC declares it from <string.h> instead */
-#endif
 #include <stdlib.h>
 #include <string.h>
 
@@ -128,7 +125,7 @@ static CURL* client_handle(sfcc_client* c){
  * "Authorization:" does. */
 static int name_is(const char* line, const char* name){
   const size_t n = strlen(name);
-  if(strncasecmp(line, name, n) != 0){
+  if(sfcc_strncasecmp(line, name, n) != 0){
     return 0;
   }
   const char after = line[n];

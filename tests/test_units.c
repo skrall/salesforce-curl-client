@@ -371,6 +371,23 @@ static void test_strings(void){
   check(sfcc_str_eq("a", "b") == 0, "different strings differ");
   check(sfcc_str_eq(NULL, NULL) == 1, "two NULLs are equal");
   check(sfcc_str_eq("a", NULL) == 0, "NULL is not equal to a string");
+
+  /* Header names are matched case-insensitively, so this comparison is
+   * load-bearing on every request. It was also briefly missing: MSVC declares
+   * neither <strings.h> nor strncasecmp, so the call compiled to an implicit
+   * extern declaration and C4013 rather than failing outright. */
+  check(sfcc_strncasecmp("authorization", "Authorization", 13) == 0,
+        "header names match across case");
+  check(sfcc_strncasecmp("AUTHORIZATION", "authorization", 13) == 0,
+        "case folding works the other way too");
+  check(sfcc_strncasecmp("authorization", "authorizations", 13) == 0,
+        "the length limit cuts the comparison short");
+  check(sfcc_strncasecmp("authorization", "authorisation", 13) != 0,
+        "a different header name does not match");
+  check(sfcc_strncasecmp("accept", "Authorization", 6) != 0,
+        "short names are not equal by accident");
+  check(sfcc_strncasecmp("a", NULL, 1) != 0, "NULL is not equal to a string");
+  check(sfcc_strncasecmp(NULL, NULL, 1) == 0, "two NULLs are equal");
 }
 
 /*
