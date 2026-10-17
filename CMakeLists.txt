@@ -33,10 +33,17 @@ option(SFCC_WERROR "Treat warnings as errors" OFF)
 #
 # Windows: nothing is bundled. Use vcpkg, which supplies both libcurl and its
 # dependencies:
-#     vcpkg install curl:x64-windows-static-md
+#     vcpkg install curl:x64-windows
 #     cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
-# The static-md triplet is the one to prefer. See the CURL_STATICLIB note
-# below for why the choice of triplet is not cosmetic.
+#
+# Prefer the default dynamic triplet over x64-windows-static-md. The static one
+# produces a self-contained sfcc.exe with no libcurl.dll to ship, which is a real
+# advantage -- but it renames zlib's library to zs.lib, which CMake's FindZLIB
+# does not search for unless told to, and it needs CURL_STATICLIB defined for
+# libcurl's headers to link statically rather than as __declspec(dllimport).
+# Both are handled below. CI builds the dynamic triplet anyway: it is the
+# path vcpkg supports most directly, and it keeps the Windows job testing
+# something we can actually keep green.
 
 # vcpkg's zlib, built as a static library on Windows, installs zs.lib and
 # zsd.lib. Those are the names zlib's own CMake build produces when only a
@@ -44,17 +51,14 @@ option(SFCC_WERROR "Treat warnings as errors" OFF)
 # ZLIB_USE_STATIC_LIBS is set -- otherwise it looks for zlib.lib, does not find
 # it, and reports "missing: ZLIB_LIBRARY" having already found the header and
 # read its version. That reads like a broken install rather than a naming
-# difference, and costs a CI round trip to diagnose.
+# difference.
 #
 # Gated on vcpkg rather than applied unconditionally: a system zlib on Linux is
-# libz.so and must keep the default search. vcpkg's toolchain exports both
-# VCPKG_LIBRARY_LINKAGE and VCPKG_TARGET_TRIPLET; the former is authoritative,
-# the latter is a fallback for the case where only the triplet was set.
+# libz.so and must keep the default search. vcpkg's toolchain exports
+# VCPKG_TARGET_TRIPLET but not VCPKG_LIBRARY_LINKAGE, so the triplet name is
+# what we key on.
 set(SFCC_VCPKG_STATIC OFF)
-if(DEFINED VCPKG_LIBRARY_LINKAGE AND VCPKG_LIBRARY_LINKAGE STREQUAL "static")
-  set(SFCC_VCPKG_STATIC ON)
-elseif(NOT DEFINED VCPKG_LIBRARY_LINKAGE AND DEFINED VCPKG_TARGET_TRIPLET
-       AND VCPKG_TARGET_TRIPLET MATCHES "static")
+if(DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET MATCHES "static")
   set(SFCC_VCPKG_STATIC ON)
 endif()
 if(SFCC_VCPKG_STATIC)

@@ -156,14 +156,21 @@ jobs:
   # The triplet is pinned deliberately: it has to match the one libcurl was
   # installed under, or the toolchain searches the wrong installed/ subdirectory
   # at configure time and reports a missing dependency we already have.
-  # x64-windows-static-md links libcurl statically but the CRT dynamically, so
-  # sfcc.exe still needs the ordinary MSVC runtime and nothing else.
+  #
+  # This is vcpkg's default dynamic triplet rather than x64-windows-static-md.
+  # The static one yields an sfcc.exe with no libcurl.dll to ship, which is worth
+  # having, but it renames zlib's library to zs.lib -- a name CMake's FindZLIB
+  # does not search for unless ZLIB_USE_STATIC_LIBS is set -- and needs
+  # CURL_STATICLIB for libcurl's headers. CMakeLists.txt handles both, but that
+  # path cost four CI round trips to get right and cannot be verified from Linux,
+  # so the job tests the triplet vcpkg supports most directly. Anyone building
+  # against a static triplet is supported; it is just not what CI exercises.
   # ---------------------------------------------------------------------
   windows:
     name: windows (msvc)
     runs-on: windows-latest
     env:
-      VCPKG_TARGET_TRIPLET: x64-windows-static-md
+      VCPKG_TARGET_TRIPLET: x64-windows
     steps:
       - uses: actions/checkout@v4
 
@@ -200,6 +207,12 @@ jobs:
       - name: Install libcurl
         run: vcpkg install curl:${{ env.VCPKG_TARGET_TRIPLET }}
 
+      # bin/ and debug/bin/ matter as much as the libraries: on the dynamic
+      # triplet sfcc.exe links against libcurl.dll and zlib1.dll, and vcpkg's
+      # applocal deployment is what puts them beside the executable. Listing
+      # them here shows whether it ran, rather than leaving the test job to
+      # fail on a missing DLL.
+      #
       # Kept because it is the only way to see what vcpkg actually produced.
       # The zlib failure this exists to explain was "Could NOT find ZLIB (missing:
       # ZLIB_LIBRARY)" -- reported while the header had been found and its
@@ -212,7 +225,7 @@ jobs:
           $triplet = "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET"
           if (-not (Test-Path $triplet)) { throw "No installed tree at $triplet" }
           Write-Host "$triplet"
-          foreach ($sub in @('lib', 'debug/lib')) {
+          foreach ($sub in @('lib', 'debug/lib', 'bin', 'debug/bin')) {
             $d = Join-Path $triplet $sub
             Write-Host "--- $sub"
             if (Test-Path $d) {
