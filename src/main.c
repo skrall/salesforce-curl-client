@@ -790,13 +790,27 @@ int main(int argc, char** argv){
                       "       sfcc rest /services/data/{version}/limits\n");
       rc = 2;
     }else{
+      /*
+       * NULL-terminate before handing the array over. The API takes a
+       * NULL-terminated `const char* const*` and walks it until the sentinel,
+       * so without this it runs off the end of the stack array and dereferences
+       * whatever happens to be there. That is not a theoretical hazard: it
+       * segfaulted at -O2, where the slot is not incidentally zero, while
+       * working by luck in a debug build. One slot is reserved for this at the
+       * declaration, and the -H parser refuses to fill it.
+       */
+      const char* const* hdrs = NULL;
+      if(nrest_headers > 0){
+        rest_headers[nrest_headers] = NULL;
+        hdrs = rest_headers;
+      }
       const rest_args ra = {
         .method = rest_method,
         .data = rest_data,
         .data_file = rest_data_file,
         .output = rest_output,
         .include = rest_include,
-        .headers = nrest_headers > 0 ? rest_headers : NULL,
+        .headers = hdrs,
       };
       rc = cmd_rest(c, args[0], &ra);
     }

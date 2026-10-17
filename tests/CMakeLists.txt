@@ -156,6 +156,35 @@ set_tests_properties(cli_rest_missing_at_file PROPERTIES
   WILL_FAIL TRUE
   ENVIRONMENT "SFCC_CLIENT_ID=;SFCC_CLIENT_SECRET=;SFCC_ACCESS_TOKEN=;SFCC_INSTANCE_URL=")
 
+# A custom request header must not crash the process.
+#
+# Regression test for an unterminated header array: the -H list is handed to the
+# API as a NULL-terminated `const char* const*` and walked to the sentinel, so a
+# missing terminator meant reading past the end of a stack array and
+# dereferencing whatever was there. Harmless at -O0, where the slot happens to
+# be zero; a segfault at -O2. ASan does not see it either, since the memory was
+# still valid -- just not ours.
+#
+# PASS_REGULAR_EXPRESSION rather than an exit code, because a crash and a clean
+# failure both exit non-zero. The assertion is that we reach the transport and
+# report its refusal; a segfault produces no such output, so the test still
+# fails while the bug is present.
+#
+# 127.0.0.1:1 refuses instantly, so no server or network is needed. The instance
+# and token are supplied directly so this gets as far as building the request.
+add_test(NAME cli_rest_custom_header_no_crash
+  COMMAND sfcc_cli rest limits -H "X-Test: 1"
+          --instance http://127.0.0.1:1 --token dummy)
+set_tests_properties(cli_rest_custom_header_no_crash PROPERTIES
+  PASS_REGULAR_EXPRESSION "could not reach")
+
+# Several headers, so the walk gets past the first terminator slot.
+add_test(NAME cli_rest_many_headers_no_crash
+  COMMAND sfcc_cli rest limits -H "X-A: 1" -H "X-B: 2" -H "X-C: 3"
+          --instance http://127.0.0.1:1 --token dummy)
+set_tests_properties(cli_rest_many_headers_no_crash PROPERTIES
+  PASS_REGULAR_EXPRESSION "could not reach")
+
 # A query with no statement.
 add_test(NAME cli_query_needs_soql COMMAND sfcc_cli query)
 set_tests_properties(cli_query_needs_soql PROPERTIES WILL_FAIL TRUE)
