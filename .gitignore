@@ -1,0 +1,36 @@
+# build output
+build/
+install/
+compile_commands.json
+CMakeUserPresets.json
+
+# editor / OS noise
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# never commit a token cache; it holds a live bearer token
+.sfcc-token.json
+*.sfcc-token.json
+
+# Local credential files. These carry a live bearer token and/or a connected
+# app secret, so committing one is a credential leak that survives rewriting
+# history -- the remedy would be rotating the secret, not just deleting the
+# file afterwards.
+#
+# Covers .env, every .env.* variant (.env.local, .env.production, ...) and the
+# named form (sf.env, prod.env).
+.env
+.env.*
+*.env
+
+# ...except the templates, which exist precisely to be committed. These have to
+# come after the patterns above, since the last matching rule wins.
+!.env.example
+!.env.sample
+!.env.template
+!*.env.example
+!*.env.sample
+!*.env.template

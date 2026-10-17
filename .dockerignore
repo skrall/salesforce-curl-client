@@ -1,0 +1,26 @@
+# Everything below is either irrelevant to the build or would be copied in for
+# no reason. The build context is uploaded before any RUN, so a stale build/
+# directory is worth kilobytes here and megabytes of wasted transfer without it.
+
+build/
+install/
+compile_commands.json
+CMakeUserPresets.json
+
+.git/
+.gitignore
+.github/
+
+# Test and scratch files the tests write next to the binary.
+sfcc_test_*.txt
+sfcc_test_*.bin
+
+*.swp
+*~
+.DS_Store
+.vscode/
+.idea/
+
+# Never let a real token cache into an image, even by accident.
+.sfcc-token.json
+*.sfcc-token.json
