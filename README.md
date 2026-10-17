@@ -117,6 +117,7 @@ Sandboxes use `--login-url https://test.salesforce.com`.
 | `update <object> <id> <json>` | Update a record |
 | `delete <object> <id>` | Delete a record |
 | `describe <object>` | Object metadata: fields, types, picklists |
+| `sobjects` | Every object in the org, as a table |
 | `versions` | API versions this org supports |
 | `rest <path>` | One raw REST call, with auth applied |
 | `deploy --zip <file>` | Deploy a prebuilt metadata package |
@@ -143,6 +144,41 @@ Sandboxes use `--login-url https://test.salesforce.com`.
 | `SFCC_ACCESS_TOKEN` | Pre-minted access token |
 | `SFCC_API_VERSION` | API version |
 | `SFCC_TOKEN_CACHE` | Token cache path |
+
+### Listing what is in the org
+
+`sobjects` fetches the global object listing — API name, label, key prefix, and
+the capability flags — and prints it as a table:
+
+```console
+$ sfcc sobjects --custom --filter invoice
+NAME        LABEL             PREFIX  CUST  CRE  UPD  DEL  UNDEL  QRY  RET  SRCH  LAY  MRG  TRIG
+Invoice__c  Customer Invoice  inv     yes   yes  yes  yes  yes    yes  yes  yes   yes  no   yes
+1 of 214 objects
+```
+
+Without `--raw` you get that table; with `--raw` you get the API response, which
+includes the flags the table leaves out (`customSetting`, `feedEnabled`,
+`deprecatedAndHidden`, `hasSubtypes`, `isSubtype`, `mruEnabled`). Nothing is
+unavailable — it is only unlisted, and the table keeps to the flags worth
+reading at a glance.
+
+| Option | Description |
+| --- | --- |
+| `--raw` | Print the API response instead of the table |
+| `--custom` | Only custom objects, skipping the platform ones |
+| `--filter <text>` | Keep objects whose name or label contains `<text>`, ignoring case |
+| `--limit <n>` | Show at most `<n>` objects |
+| `--no-header` | Omit the column header line |
+
+Column widths are measured over the rows actually printed, so `--filter` gives
+a table sized to its results rather than padded to fit objects it dropped. A
+flag Salesforce omits renders as `no` rather than as a blank, because a
+capability table with holes in it is harder to read than one that is
+pessimistic.
+
+`describe <object>` is the other half of this: it takes one object and returns
+its fields, types and picklist values.
 
 ### The `rest` escape hatch
 

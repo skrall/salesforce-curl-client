@@ -196,6 +196,14 @@ sfcc_status sfcc_whoami(sfcc_client* c, char** out);
 /* Object metadata: field names, types, picklist values. */
 sfcc_status sfcc_describe(sfcc_client* c, const char* sobject, char** out);
 
+/* Every object this org exposes, as the global SObject listing: API name, label,
+ * key prefix, and the createable/updateable/queryable style capability flags.
+ * One call; the response is a single JSON document with a "sobjects" array.
+ *
+ * Callers wanting one object's full metadata should use sfcc_describe instead --
+ * this is the index, not the detail. */
+sfcc_status sfcc_list_sobjects(sfcc_client* c, char** out);
+
 /* API versions this org supports. Needs no object, but does need auth. */
 sfcc_status sfcc_list_versions(sfcc_client* c, char** out);
 

@@ -194,21 +194,6 @@ static char* build_options_json(const sfcc_deploy_options* o){
 /* Status reporting                                                         */
 /* ------------------------------------------------------------------------ */
 
-static int json_bool(const cJSON* o, const char* key){
-  const cJSON* f = cJSON_GetObjectItemCaseSensitive(o, key);
-  return cJSON_IsTrue(f);
-}
-
-static int json_int(const cJSON* o, const char* key, int fallback){
-  const cJSON* f = cJSON_GetObjectItemCaseSensitive(o, key);
-  return cJSON_IsNumber(f) ? (int)f->valuedouble : fallback;
-}
-
-static const char* json_str(const cJSON* o, const char* key, const char* dflt){
-  const cJSON* f = cJSON_GetObjectItemCaseSensitive(o, key);
-  return (cJSON_IsString(f) && f->valuestring) ? f->valuestring : dflt;
-}
-
 /*
  * Render the per-component detail lines.
  *
@@ -226,11 +211,11 @@ static void append_components(sfcc_buf* out, const cJSON* details,
   }
   const cJSON* it = NULL;
   cJSON_ArrayForEach(it, arr){
-    const char* full = json_str(it, "fullName", "?");
-    const char* type = json_str(it, "componentType", "?");
-    const char* file = json_str(it, "fileName", "");
-    const int line = json_int(it, "lineNumber", 0);
-    const int col = json_int(it, "columnNumber", 0);
+    const char* full = sfcc_json_str(it, "fullName", "?");
+    const char* type = sfcc_json_str(it, "componentType", "?");
+    const char* file = sfcc_json_str(it, "fileName", "");
+    const int line = sfcc_json_int(it, "lineNumber", 0);
+    const int col = sfcc_json_int(it, "columnNumber", 0);
 
     if(strcmp(key, "componentFailures") == 0){
       sfcc_buf_printf(out, "\n  %s %s (%s)\n", mark, full, type);
@@ -240,7 +225,7 @@ static void append_components(sfcc_buf* out, const cJSON* details,
        * failure into four ragged lines with a blank line through the middle, so
        * the padding is stripped and the remaining lines re-indented.
        */
-      const char* problem = json_str(it, "problem", "");
+      const char* problem = sfcc_json_str(it, "problem", "");
       while(*problem == '\n' || *problem == '\r' || *problem == ' ' ||
             *problem == '\t'){
         ++problem;
@@ -282,9 +267,9 @@ static void append_components(sfcc_buf* out, const cJSON* details,
         }
       }
     }else{
-      const char* action = json_bool(it, "created") ? "created"
-                       : json_bool(it, "deleted") ? "deleted"
-                       : json_bool(it, "updated") ? "updated"
+      const char* action = sfcc_json_bool(it, "created") ? "created"
+                       : sfcc_json_bool(it, "deleted") ? "deleted"
+                       : sfcc_json_bool(it, "updated") ? "updated"
                        : "deployed";
       sfcc_buf_printf(out, "\n  %s %s (%s, %s)\n", mark, full, type, action);
       if(*file){
@@ -343,10 +328,10 @@ static char* render_report(const sfcc_deploy_result* r,
     if(cJSON_IsObject(rt)){
       sfcc_buf_printf(&out,
                       "\n  tests: %d passed, %d failed, %d skipped of %d run",
-                      json_int(rt, "numberPassed", -1),
-                      json_int(rt, "numberFailed", -1),
-                      json_int(rt, "numberSkipped", -1),
-                      json_int(rt, "numberTestsRun", -1));
+                      sfcc_json_int(rt, "numberPassed", -1),
+                      sfcc_json_int(rt, "numberFailed", -1),
+                      sfcc_json_int(rt, "numberSkipped", -1),
+                      sfcc_json_int(rt, "numberTestsRun", -1));
     }
   }
   cJSON_Delete(root);
@@ -371,12 +356,12 @@ static void parse_status(const char* body, sfcc_deploy_result* out){
     }
     return;
   }
-  sfcc_strset(&out->status, json_str(root, "status", NULL));
-  out->done = json_bool(root, "done");
-  out->total = json_int(root, "numberComponentsTotal", 0);
-  out->deployed = json_int(root, "numberComponentsDeployed", 0);
-  out->errors = json_int(root, "numberComponentsError", 0);
-  out->skipped = json_int(root, "numberComponentsSkipped", 0);
+  sfcc_strset(&out->status, sfcc_json_str(root, "status", NULL));
+  out->done = sfcc_json_bool(root, "done");
+  out->total = sfcc_json_int(root, "numberComponentsTotal", 0);
+  out->deployed = sfcc_json_int(root, "numberComponentsDeployed", 0);
+  out->errors = sfcc_json_int(root, "numberComponentsError", 0);
+  out->skipped = sfcc_json_int(root, "numberComponentsSkipped", 0);
   out->succeeded = (out->status != NULL && strcmp(out->status, "Succeeded") == 0);
   if(out->status != NULL && strcmp(out->status, "Canceled") == 0){
     out->was_cancelled = 1;
@@ -574,7 +559,7 @@ sfcc_status sfcc_deploy_zip(sfcc_client* c, const char* zip_path,
     return sfcc_fail(c, SFCC_ERR_JSON,
                      "deploy request did not return the expected JSON");
   }
-  sfcc_strset(&out->id, json_str(root, "id", NULL));
+  sfcc_strset(&out->id, sfcc_json_str(root, "id", NULL));
   cJSON_Delete(root);
   sfcc_response_free(&resp);
 

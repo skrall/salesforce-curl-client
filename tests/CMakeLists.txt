@@ -189,6 +189,25 @@ set_tests_properties(cli_rest_many_headers_no_crash PROPERTIES
 add_test(NAME cli_query_needs_soql COMMAND sfcc_cli query)
 set_tests_properties(cli_query_needs_soql PROPERTIES WILL_FAIL TRUE)
 
+# sobjects argument handling. All three are checked before any credential is
+# needed, so they need no environment clearing and no network.
+#
+# PASS_REGULAR_EXPRESSION rather than an exit code, matching the header tests
+# above: the assertion is that the *reason* is reported, which a bare "exited
+# nonzero" would not distinguish from a failure to authenticate.
+add_test(NAME cli_sobjects_rejects_argument
+  COMMAND sfcc_cli sobjects Account --instance http://127.0.0.1:1 --token dummy)
+set_tests_properties(cli_sobjects_rejects_argument PROPERTIES
+  PASS_REGULAR_EXPRESSION "describe <object>")
+
+add_test(NAME cli_limit_must_be_positive COMMAND sfcc_cli sobjects --limit 0)
+set_tests_properties(cli_limit_must_be_positive PROPERTIES
+  PASS_REGULAR_EXPRESSION "positive number")
+
+add_test(NAME cli_filter_needs_a_value COMMAND sfcc_cli sobjects --filter)
+set_tests_properties(cli_filter_needs_a_value PROPERTIES
+  PASS_REGULAR_EXPRESSION "needs a value")
+
 # --- end-to-end -------------------------------------------------------------
 #
 # The tests above cover units and CLI argument handling with no server. This one
