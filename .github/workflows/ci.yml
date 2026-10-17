@@ -151,29 +151,62 @@ jobs:
         run: ctest --test-dir build --output-on-failure
 
   # ---------------------------------------------------------------------
-  # Windows via MSVC and vcpkg. Nothing is bundled, so vcpkg supplies libcurl;
-  # the cache keeps this from costing minutes on every push.
+  # Windows via MSVC and vcpkg. Nothing is bundled, so vcpkg supplies libcurl.
+  #
+  # The triplet is pinned deliberately: it has to match the one libcurl was
+  # installed under, or the toolchain searches the wrong installed/ subdirectory
+  # at configure time and reports a missing dependency we already have.
+  # x64-windows-static-md links libcurl statically but the CRT dynamically, so
+  # sfcc.exe still needs the ordinary MSVC runtime and nothing else.
   # ---------------------------------------------------------------------
   windows:
     name: windows (msvc)
     runs-on: windows-latest
+    env:
+      VCPKG_TARGET_TRIPLET: x64-windows-static-md
     steps:
       - uses: actions/checkout@v4
 
-      - name: Set up vcpkg
+      - name: Set up CMake
         uses: lukka/get-cmake@latest
         with:
           cmakeVersion: '>=3.21'
 
+      # windows-latest ships vcpkg preinstalled but does not put it on PATH
+      # under a name our steps can rely on, and the variable naming it differs
+      # between images. Resolve it once here and fail loudly if it is missing,
+      # rather than handing CMake an empty path and letting it say something
+      # unhelpful later. (It previously did exactly that: VCPKG_ROOT was never
+      # defined, so the toolchain argument arrived as
+      # -DCMAKE_TOOLCHAIN_FILE=/scripts/buildsystems/vcpkg.cmake.)
+      - name: Locate vcpkg
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_ROOT) {
+            $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          }
+          if (-not $env:VCPKG_ROOT) {
+            $env:VCPKG_ROOT = 'C:\vcpkg'
+          }
+          $toolchain = Join-Path $env:VCPKG_ROOT 'scripts/buildsystems/vcpkg.cmake'
+          if (-not (Test-Path $toolchain)) {
+            throw "No vcpkg toolchain at $toolchain (VCPKG_ROOT=$env:VCPKG_ROOT)"
+          }
+          Write-Host "vcpkg toolchain: $toolchain"
+          "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Warms vcpkg's binary cache, so configure links an already-built libcurl
+      # instead of spending minutes compiling it and its dependencies.
       - name: Install libcurl
-        run: vcpkg install curl:x64-windows-static-md
+        run: vcpkg install curl:${{ env.VCPKG_TARGET_TRIPLET }}
 
       - name: Configure
-        run: >
-          cmake -S . -B build
-          -A x64
-          -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
-          -DCMAKE_BUILD_TYPE=Release
+        shell: pwsh
+        # Quoted, and read from the shell's own environment rather than
+        # substituted by Actions. Unquoted, pwsh split the argument and CMake
+        # received "/scripts/buildsystems/vcpkg" plus a stray ".cmake".
+        run: |
+          cmake -S . -B build -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
 
       - name: Build
         run: cmake --build build --config Release --parallel
