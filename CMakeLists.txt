@@ -38,6 +38,29 @@ option(SFCC_WERROR "Treat warnings as errors" OFF)
 # The static-md triplet is the one to prefer. See the CURL_STATICLIB note
 # below for why the choice of triplet is not cosmetic.
 
+# vcpkg's zlib, built as a static library on Windows, installs zs.lib and
+# zsd.lib. Those are the names zlib's own CMake build produces when only a
+# static library is requested, and FindZLIB only searches for them when
+# ZLIB_USE_STATIC_LIBS is set -- otherwise it looks for zlib.lib, does not find
+# it, and reports "missing: ZLIB_LIBRARY" having already found the header and
+# read its version. That reads like a broken install rather than a naming
+# difference, and costs a CI round trip to diagnose.
+#
+# Gated on vcpkg rather than applied unconditionally: a system zlib on Linux is
+# libz.so and must keep the default search. vcpkg's toolchain exports both
+# VCPKG_LIBRARY_LINKAGE and VCPKG_TARGET_TRIPLET; the former is authoritative,
+# the latter is a fallback for the case where only the triplet was set.
+set(SFCC_VCPKG_STATIC OFF)
+if(DEFINED VCPKG_LIBRARY_LINKAGE AND VCPKG_LIBRARY_LINKAGE STREQUAL "static")
+  set(SFCC_VCPKG_STATIC ON)
+elseif(NOT DEFINED VCPKG_LIBRARY_LINKAGE AND DEFINED VCPKG_TARGET_TRIPLET
+       AND VCPKG_TARGET_TRIPLET MATCHES "static")
+  set(SFCC_VCPKG_STATIC ON)
+endif()
+if(SFCC_VCPKG_STATIC)
+  set(ZLIB_USE_STATIC_LIBS ON)
+endif()
+
 find_package(CURL REQUIRED)
 
 # FindCURL has exported a usable imported target since CMake 3.14, but not in
@@ -58,10 +81,14 @@ endif()
 # mentioning __imp_curl_easy_init, which is a genuinely confusing first
 # experience with vcpkg. CMake's FindCURL already defines CURL_STATICLIB when it
 # detects a static library; this covers the paths where it does not.
-if(WIN32 AND NOT BUILD_SHARED_LIBS)
+if(WIN32 AND (NOT BUILD_SHARED_LIBS OR SFCC_VCPKG_STATIC))
   if(TARGET CURL::libcurl)
     get_target_property(_sfcc_curl_type CURL::libcurl TYPE)
-    if(_sfcc_curl_type STREQUAL "STATIC_LIBRARY")
+    # A vcpkg static triplet settles the linkage regardless of how the imported
+    # target reports itself, and UNKNOWN_LIBRARY is a common way for a config
+    # package to describe a static library. Trust the triplet over the type
+    # rather than silently skipping the define and failing to link later.
+    if(_sfcc_curl_type STREQUAL "STATIC_LIBRARY" OR SFCC_VCPKG_STATIC)
       target_compile_definitions(CURL::libcurl INTERFACE CURL_STATICLIB)
     endif()
   endif()

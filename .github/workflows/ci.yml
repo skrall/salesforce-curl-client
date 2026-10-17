@@ -200,44 +200,27 @@ jobs:
       - name: Install libcurl
         run: vcpkg install curl:${{ env.VCPKG_TARGET_TRIPLET }}
 
-      # vcpkg's curl port pulls in zlib through CURLConfig.cmake's
-      # find_dependency(ZLIB), so a Windows failure can be a zlib problem wearing
-      # curl's name. Nothing about "Could NOT find ZLIB (missing: ZLIB_LIBRARY)"
-      # says whether the file is absent, merely misnamed, or present but
-      # unreachable. So: dump what is actually on disk, then ask a bare CMake --
-      # no vcpkg toolchain -- to find it the way FindZLIB does. If the bare
-      # probe succeeds and the real configure does not, the difference is the
-      # toolchain's find-root modes rather than anything on disk.
-      - name: Diagnose the vcpkg installed tree
+      # Kept because it is the only way to see what vcpkg actually produced.
+      # The zlib failure this exists to explain was "Could NOT find ZLIB (missing:
+      # ZLIB_LIBRARY)" -- reported while the header had been found and its
+      # version read, because static zlib installs zs.lib and FindZLIB does not
+      # look for that name unless ZLIB_USE_STATIC_LIBS is set. Nothing in that
+      # message distinguishes a naming difference from a broken install.
+      - name: Show the vcpkg installed tree
         shell: pwsh
         run: |
           $triplet = "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET"
-          Write-Host "triplet:   $env:VCPKG_TARGET_TRIPLET"
-          Write-Host "installed: $triplet"
           if (-not (Test-Path $triplet)) { throw "No installed tree at $triplet" }
-
-          foreach ($sub in @('include', 'lib', 'debug/lib', 'share')) {
+          Write-Host "$triplet"
+          foreach ($sub in @('lib', 'debug/lib')) {
             $d = Join-Path $triplet $sub
             Write-Host "--- $sub"
             if (Test-Path $d) {
-              Get-ChildItem $d | ForEach-Object { Write-Host "    $($_.Name)" }
+              Get-ChildItem $d -Name | ForEach-Object { Write-Host "    $_" }
             } else {
               Write-Host "    (absent)"
             }
           }
-
-          Write-Host "--- bare CMake probe, no vcpkg toolchain:"
-          $probe = @'
-          message(STATUS "prefix=${CMAKE_PREFIX_PATH}")
-          find_path(ZI NAMES zlib.h PATH_SUFFIXES include)
-          find_library(ZL NAMES z zlib zdll zlib1 zlibstatic zlibstat PATH_SUFFIXES lib)
-          find_library(ZC NAMES libcurl curl PATH_SUFFIXES lib)
-          message(STATUS "zlib.h   -> ${ZI}")
-          message(STATUS "zlib lib -> ${ZL}")
-          message(STATUS "curl lib -> ${ZC}")
-          '@
-          Set-Content -Path probe.cmake -Value $probe -Encoding utf8
-          cmake "-DCMAKE_PREFIX_PATH=$triplet" -P probe.cmake
 
       - name: Configure
         shell: pwsh
