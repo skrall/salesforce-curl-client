@@ -156,7 +156,19 @@ target_compile_options(sfcc PRIVATE ${SFCC_WARNINGS})
 
 # --- the executable ---------------------------------------------------------
 add_executable(sfcc_cli src/main.c)
+# The binary is named sfcc, the same as the static library, because that is what
+# both are called everywhere else and the library is an implementation detail of
+# it.
 set_target_properties(sfcc_cli PROPERTIES OUTPUT_NAME sfcc)
+# MSVC's linker emits an import library alongside any executable whose output
+# name it knows, and places it in the target's ARCHIVE directory -- which for a
+# multi-config generator is <build>/<config>/sfcc.lib, exactly where the static
+# library above already is. The link then fails with "LNK1149: output filename
+# matches input filename". A command-line tool exports nothing, so the import
+# library is of no use to anyone; give it a directory of its own and the clash
+# disappears. No effect on single-config generators, which do not produce one.
+set_target_properties(sfcc_cli PROPERTIES
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/import")
 target_link_libraries(sfcc_cli PRIVATE sfcc)
 target_compile_options(sfcc_cli PRIVATE ${SFCC_WARNINGS})
 
