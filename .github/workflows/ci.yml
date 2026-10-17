@@ -200,29 +200,44 @@ jobs:
       - name: Install libcurl
         run: vcpkg install curl:${{ env.VCPKG_TARGET_TRIPLET }}
 
-      # vcpkg's curl port deliberately ships no CURLConfig.cmake. It is meant to
-      # be consumed through CMake's built-in find_package, which means the
-      # search depends on vcpkg's own wrapper having put the installed tree on
-      # the prefix path. When that does not happen the only symptom is
-      #
-      #   Could NOT find CURL (missing: CURL_LIBRARY CURL_INCLUDE_DIR)
-      #
-      # which says nothing about why. Print what is actually on disk, so the
-      # next failure of this kind is diagnosable from the log alone.
-      - name: Show what vcpkg installed
+      # vcpkg's curl port pulls in zlib through CURLConfig.cmake's
+      # find_dependency(ZLIB), so a Windows failure can be a zlib problem wearing
+      # curl's name. Nothing about "Could NOT find ZLIB (missing: ZLIB_LIBRARY)"
+      # says whether the file is absent, merely misnamed, or present but
+      # unreachable. So: dump what is actually on disk, then ask a bare CMake --
+      # no vcpkg toolchain -- to find it the way FindZLIB does. If the bare
+      # probe succeeds and the real configure does not, the difference is the
+      # toolchain's find-root modes rather than anything on disk.
+      - name: Diagnose the vcpkg installed tree
         shell: pwsh
         run: |
           $triplet = "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET"
           Write-Host "triplet:   $env:VCPKG_TARGET_TRIPLET"
           Write-Host "installed: $triplet"
           if (-not (Test-Path $triplet)) { throw "No installed tree at $triplet" }
-          Write-Host "--- curl artefacts actually present:"
-          Get-ChildItem -Path $triplet -Recurse -Include curl.h,curl.lib,libcurl.lib,libcurl.a -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $($_.FullName)" }
-          if (Test-Path "$triplet\include\curl\curl.h") {
-            Write-Host "curl headers: present"
-          } else {
-            Write-Host "curl headers: ABSENT"
+
+          foreach ($sub in @('include', 'lib', 'debug/lib', 'share')) {
+            $d = Join-Path $triplet $sub
+            Write-Host "--- $sub"
+            if (Test-Path $d) {
+              Get-ChildItem $d | ForEach-Object { Write-Host "    $($_.Name)" }
+            } else {
+              Write-Host "    (absent)"
+            }
           }
+
+          Write-Host "--- bare CMake probe, no vcpkg toolchain:"
+          $probe = @'
+          message(STATUS "prefix=${CMAKE_PREFIX_PATH}")
+          find_path(ZI NAMES zlib.h PATH_SUFFIXES include)
+          find_library(ZL NAMES z zlib zdll zlib1 zlibstatic zlibstat PATH_SUFFIXES lib)
+          find_library(ZC NAMES libcurl curl PATH_SUFFIXES lib)
+          message(STATUS "zlib.h   -> ${ZI}")
+          message(STATUS "zlib lib -> ${ZL}")
+          message(STATUS "curl lib -> ${ZC}")
+          '@
+          Set-Content -Path probe.cmake -Value $probe -Encoding utf8
+          cmake "-DCMAKE_PREFIX_PATH=$triplet" -P probe.cmake
 
       - name: Configure
         shell: pwsh
