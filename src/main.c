@@ -31,6 +31,12 @@
 
 static int g_raw_output = 0;
 static int g_quiet = 0;
+/* Presentation, not a per-command choice: every table in the client
+ * honours it. It was a field in each command's option struct, which
+ * meant the flag only reached whichever command's struct the parser
+ * happened to write to -- `describe --no-header` silently kept its
+ * headers. */
+static int g_no_header = 0;
 
 /* ------------------------------------------------------------------------ */
 
@@ -55,7 +61,7 @@ static void usage(FILE* out){
 "  create <object> <json>      insert a record\n"
 "  update <object> <id> <json> update a record\n"
 "  delete <object> <id>        delete a record\n"
-"  describe <object>           object metadata: fields and types\n"
+"  describe <object>           object metadata: fields, children, record types\n"
 "  sobjects                    every object in the org, as a table\n"
 "  versions                    API versions this org supports\n"
 "  deploy --zip <file>         deploy a prebuilt metadata package\n"
@@ -79,6 +85,35 @@ static void usage(FILE* out){
 "  --quiet                     suppress the trailing status line\n"
 "  --insecure-skip-verify      DANGER: disable TLS certificate checks\n"
 "\n"
+"describe options:\n"
+"  --json                      print the whole response as indented JSON\n"
+"  --field <text>              only fields whose name or label contains <text>\n"
+"  --no-header                 omit the column header line of each table\n"
+"  Without these, three tables are printed: fields, child relationships and\n"
+"  record types. Each column is documented under \"describe columns\" below.\n"
+"\n"
+"describe columns:\n"
+"  fields:\n"
+"    NAME          the field's API name, as used in SOQL\n"
+"    LABEL         its display label\n"
+"    TYPE          datatype: string, reference, currency, picklist, ...\n"
+"    LEN           maximum length; \"-\" where the type has no length\n"
+"    SIZE          precision,scale for numeric types; \"-\" otherwise\n"
+"    REL NAME      the relationship this field provides, if any\n"
+"    REFERENCE TO  the objects this field can point at; several for a\n"
+"                  polymorphic reference such as OwnerId, which may be a\n"
+"                  User or a Group\n"
+"  child relationships:\n"
+"    FIELD         the field on the child that points back at this object\n"
+"    CHILD OBJECT  the child object's API name\n"
+"    REL NAME      the name the relationship is exposed under\n"
+"  record types:\n"
+"    ID            the record type id\n"
+"    NAME          its display name\n"
+"    DEVELOPER NAME its API name\n"
+"    ACTIVE, MASTER, AVAILABLE, DEFAULT\n"
+"\n", out);
+  fputs(
 "sobjects options:\n"
 "  --raw                       print the API response instead of the table\n"
 "  --custom                    only custom objects, skipping the platform ones\n"
@@ -136,6 +171,7 @@ static void usage(FILE* out){
 "  " SFCC_PROGNAME " update Account 001000000000000AAA '{\"Phone\":\"555-0100\"}'\n"
 "\n"
 "  " SFCC_PROGNAME " sobjects --custom --filter invoice\n"
+"  " SFCC_PROGNAME " describe Account --field Revenue\n"
 "\n"
 "  " SFCC_PROGNAME " deploy --validate-only --test-level local ./package.zip\n", out);
 }
@@ -537,7 +573,6 @@ enum { SOBJ_COLS = (int)(sizeof(SOBJ_HEADERS) / sizeof(SOBJ_HEADERS[0])) };
 typedef struct {
   int  custom_only;   /* --custom: platform objects are the majority and rarely
                        * what someone is looking for */
-  int  no_header;     /* --no-header */
   long limit;         /* --limit, 0 for all */
   const char* filter; /* --filter, matched against name and label */
 } sobjects_opts;
@@ -599,20 +634,114 @@ static int sobject_wanted(const cJSON* o, const sobjects_opts* opt){
   return 1;
 }
 
-/* Print one row, padded to the measured column widths. */
-static void print_row(const char* const* cells, const int* widths){
-  for(int i = 0 ; i < SOBJ_COLS ; ++i){
-    if(i > 0){
-      fputs("  ", stdout);
+/* ------------------------------------------------------------------------ */
+/* Tables                                                                    */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Rows are collected before anything is printed, because column widths have to
+ * be known to lay out the first row. Measuring as you go would mean printing
+ * before you knew how wide the columns were.
+ *
+ * Cells are borrowed, not copied: they point into the parsed response tree, or
+ * into a scratch buffer the caller keeps alive until the table is printed. The
+ * table therefore never outlives the tree it was filled from.
+ *
+ * ncols is dynamic rather than a fixed maximum. It was a compile-time bound
+ * once, and table_print indexed a widths[] array of that size with the *actual*
+ * column count -- so the widest table quietly wrote past the end of it and
+ * smashed the caller's stack frame. The sobjects table has fourteen columns and
+ * the bound said eight; the overflow landed on `shown`, which then read zero
+ * and sent every invocation down the "no objects matched" path. That is a
+ * confusing enough failure to keep the shape of it in the source.
+ */
+typedef struct {
+  const char* const* headers;
+  int ncols;
+  size_t nrows;
+  size_t cap;
+  const char** cells;  /* nrows * ncols, row-major */
+} table;
+
+static void table_init(table* t, const char* const* headers, int ncols){
+  t->headers = headers;
+  t->ncols = ncols;
+  t->nrows = 0;
+  t->cap = 0;
+  t->cells = NULL;
+}
+
+static int table_push(table* t, const char* const* row){
+  if(t->nrows == t->cap){
+    const size_t next = t->cap ? t->cap * 2 : 32;
+    const char** grown = realloc(t->cells, next * (size_t)t->ncols
+                                          * sizeof(*t->cells));
+    if(grown == NULL){
+      return 0;
     }
-    fputs(cells[i], stdout);
-    if(i + 1 < SOBJ_COLS){
-      for(int pad = (int)strlen(cells[i]) ; pad < widths[i] ; ++pad){
-        fputc(' ', stdout);
+    t->cells = grown;
+    t->cap = next;
+  }
+  memcpy(&t->cells[t->nrows * (size_t)t->ncols], row,
+         (size_t)t->ncols * sizeof(*row));
+  ++t->nrows;
+  return 1;
+}
+
+/* Measure the columns over the rows actually collected, then print. */
+static void table_print(const table* t, int no_header){
+  int* widths = calloc((size_t)t->ncols, sizeof(*widths));
+  if(widths == NULL){
+    return;
+  }
+  for(int i = 0 ; i < t->ncols ; ++i){
+    widths[i] = (int)strlen(t->headers[i]);
+  }
+  for(size_t r = 0 ; r < t->nrows ; ++r){
+    for(int i = 0 ; i < t->ncols ; ++i){
+      const char* cell = t->cells[r * (size_t)t->ncols + (size_t)i];
+      if(cell != NULL){
+        const int w = (int)strlen(cell);
+        if(w > widths[i]){
+          widths[i] = w;
+        }
       }
     }
   }
-  fputc('\n', stdout);
+
+  for(int r = -1 ; r < (int)t->nrows ; ++r){
+    if(r < 0 && no_header){
+      continue;
+    }
+    const char* const* row = (r < 0) ? t->headers
+                                      : &t->cells[(size_t)r * (size_t)t->ncols];
+    for(int i = 0 ; i < t->ncols ; ++i){
+      const char* cell = row[i] ? row[i] : "";
+      if(i > 0){
+        fputs("  ", stdout);
+      }
+      fputs(cell, stdout);
+      if(i + 1 < t->ncols){
+        for(int pad = (int)strlen(cell) ; pad < widths[i] ; ++pad){
+          fputc(' ', stdout);
+        }
+      }
+    }
+    fputc('\n', stdout);
+  }
+  free(widths);
+}
+
+static void table_free(table* t){
+  free(t->cells);
+  t->cells = NULL;
+  t->nrows = 0;
+  t->cap = 0;
+}
+
+/* Section heading between the tables, so the output says what each block is. */
+static void table_title(const char* title, size_t nrows){
+  printf("\n%s (%zu)\n", title, nrows);
 }
 
 static int cmd_sobjects(sfcc_client* c, const sobjects_opts* opt){
@@ -650,18 +779,13 @@ static int cmd_sobjects(sfcc_client* c, const sobjects_opts* opt){
     return 1;
   }
 
-  /* Measure the columns over the rows that will actually be printed. Sizing
-   * them against every object in the org instead would pad the header to fit
-   * something -- often only present in a filtered-out row -- that never gets
-   * printed. */
-  int widths[SOBJ_COLS];
-  for(int i = 0 ; i < SOBJ_COLS ; ++i){
-    widths[i] = (int)strlen(SOBJ_HEADERS[i]);
-  }
+  const int total = cJSON_GetArraySize(arr);
 
-  int total = cJSON_GetArraySize(arr);
-  int matched = 0;
+  table t;
+  table_init(&t, SOBJ_HEADERS, SOBJ_COLS);
 
+  int oom = 0;
+  int shown = 0;
   const cJSON* o = NULL;
   cJSON_ArrayForEach(o, arr){
     if(!sobject_wanted(o, opt)){
@@ -671,51 +795,292 @@ static int cmd_sobjects(sfcc_client* c, const sobjects_opts* opt){
      * unreachable after a break, which MSVC reports as C4702 and /WX turns
      * into a build failure. The remainder of the array is only a few hundred
      * pointer comparisons, so the walk is not worth a warning. */
-    if(opt->limit > 0 && matched >= opt->limit){
+    if(opt->limit > 0 && shown >= opt->limit){
       continue;
     }
     const char* cells[SOBJ_COLS];
     sobject_row(o, cells);
-    for(int i = 0 ; i < SOBJ_COLS ; ++i){
-      const int w = (int)strlen(cells[i]);
-      if(w > widths[i]){
-        widths[i] = w;
-      }
+    if(!table_push(&t, cells)){
+      oom = 1;
+      break;   /* not inside the macro: no unreachable increment here */
     }
-    ++matched;
+    ++shown;
   }
 
-  if(matched == 0){
-    fprintf(stderr, SFCC_PROGNAME ": no objects matched"
-                    " (%d in this org)\n", total);
+  if(oom){
+    fprintf(stderr, SFCC_PROGNAME ": out of memory\n");
+    table_free(&t);
     cJSON_Delete(root);
     return 1;
   }
 
-  if(!opt->no_header){
-    print_row(SOBJ_HEADERS, widths);
+  if(shown == 0){
+    fprintf(stderr, SFCC_PROGNAME ": no objects matched (%d in this org)\n",
+            total);
+    table_free(&t);
+    cJSON_Delete(root);
+    return 1;
   }
 
-  int printed = 0;
-  cJSON_ArrayForEach(o, arr){
-    if(!sobject_wanted(o, opt)){
-      continue;
-    }
-    if(opt->limit > 0 && printed >= opt->limit){
-      continue;
-    }
-    const char* cells[SOBJ_COLS];
-    sobject_row(o, cells);
-    print_row(cells, widths);
-    ++printed;
-  }
+  table_print(&t, g_no_header);
+  table_free(&t);
 
   if(!g_quiet){
-    printf("%d of %d object%s\n", printed, total, total == 1 ? "" : "s");
+    printf("%d of %d object%s\n", shown, total, total == 1 ? "" : "s");
   }
 
   cJSON_Delete(root);
   return 0;
+}
+
+/* ------------------------------------------------------------------------ */
+/* describe                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * Column headers. The capability columns in the sobjects table are abbreviated
+ * because eleven of them will not fit; here there are only seven, so the
+ * headers spell themselves out. REL NAME is the exception, matching sobjects.
+ */
+static const char* const DESC_FIELD_HEADERS[] = {
+  "NAME", "LABEL", "TYPE", "LEN", "SIZE", "REL NAME", "REFERENCE TO",
+};
+enum { DESC_FIELD_COLS = (int)(sizeof(DESC_FIELD_HEADERS) /
+                              sizeof(DESC_FIELD_HEADERS[0])) };
+
+static const char* const DESC_CHILD_HEADERS[] = {
+  "FIELD", "CHILD OBJECT", "REL NAME",
+};
+enum { DESC_CHILD_COLS = (int)(sizeof(DESC_CHILD_HEADERS) /
+                               sizeof(DESC_CHILD_HEADERS[0])) };
+
+static const char* const DESC_RT_HEADERS[] = {
+  "ID", "NAME", "DEVELOPER NAME", "ACTIVE", "MASTER", "AVAILABLE", "DEFAULT",
+};
+enum { DESC_RT_COLS = (int)(sizeof(DESC_RT_HEADERS) /
+                            sizeof(DESC_RT_HEADERS[0])) };
+
+typedef struct {
+  int json;                  /* --json: the whole response, indented */
+  const char* field_filter;  /* --field: substring of the field name or label */
+} describe_opts;
+
+/* Per-row scratch. The numeric columns and the joined reference list have to be
+ * formatted somewhere, and the table borrows its cells rather than copying
+ * them, so that somewhere has to outlive the table. One of these per field. */
+typedef struct {
+  char len[16];
+  char size[24];
+  char ref[512];
+} describe_field_buf;
+
+/* Join a referenceTo list into one cell.
+ *
+ * Usually a list of plain names, but the list elements are objects in some API
+ * versions, carrying the target type under "type". Both are handled rather than
+ * assumed, and anything else is skipped: printing "[object Object]" into a table
+ * is worse than printing nothing. Truncated rather than allowed to overrun. */
+static void join_reference(const cJSON* o, char* out, size_t outsz){
+  out[0] = '\0';
+  const cJSON* f = cJSON_GetObjectItemCaseSensitive(o, "referenceTo");
+  if(cJSON_IsString(f)){
+    snprintf(out, outsz, "%s", f->valuestring ? f->valuestring : "");
+    return;
+  }
+  if(!cJSON_IsArray(f)){
+    return;
+  }
+  size_t used = 0;
+  const cJSON* it = NULL;
+  cJSON_ArrayForEach(it, f){
+    const char* name = NULL;
+    if(cJSON_IsString(it)){
+      name = it->valuestring;
+    }else if(cJSON_IsObject(it)){
+      name = sfcc_json_str(it, "type", NULL);
+    }
+    if(name == NULL || *name == '\0'){
+      continue;
+    }
+    const int n = snprintf(out + used, outsz - used, "%s%s",
+                           used ? ", " : "", name);
+    if(n < 0 || (size_t)n >= outsz - used){
+      break;   /* truncated: stop rather than wrap into the next field */
+    }
+    used += (size_t)n;
+  }
+}
+
+static void desc_field_row(const cJSON* f, describe_field_buf* buf,
+                           const char** cells){
+  const int len = sfcc_json_int(f, "length", 0);
+  const int prec = sfcc_json_int(f, "precision", 0);
+  const int scale = sfcc_json_int(f, "scale", 0);
+
+  /* Zero means "not applicable" rather than "zero characters": a datetime and a
+   * boolean both report a length of 0, and printing 0 next to them invites the
+   * reader to believe it. */
+  snprintf(buf->len, sizeof(buf->len), "%s", len > 0 ? "" : "-");
+  if(len > 0){
+    snprintf(buf->len, sizeof(buf->len), "%d", len);
+  }
+
+  if(prec > 0 || scale > 0){
+    snprintf(buf->size, sizeof(buf->size), "%d,%d", prec, scale);
+  }else{
+    snprintf(buf->size, sizeof(buf->size), "-");
+  }
+
+  join_reference(f, buf->ref, sizeof(buf->ref));
+
+  cells[0] = sfcc_json_str(f, "name", "");
+  cells[1] = sfcc_json_str(f, "label", "");
+  cells[2] = sfcc_json_str(f, "type", "?");
+  cells[3] = buf->len;
+  cells[4] = buf->size;
+  cells[5] = sfcc_json_str(f, "relationshipName", NULL);
+  cells[6] = buf->ref[0] ? buf->ref : "-";
+  if(cells[5] == NULL){
+    cells[5] = "-";
+  }
+}
+
+static int desc_field_wanted(const cJSON* f, const describe_opts* opt){
+  if(opt->field_filter == NULL){
+    return 1;
+  }
+  return contains_ci(sfcc_json_str(f, "name", ""), opt->field_filter) ||
+         contains_ci(sfcc_json_str(f, "label", ""), opt->field_filter);
+}
+
+static int cmd_describe(sfcc_client* c, const char* sobject,
+                        const describe_opts* opt){
+  char* body = NULL;
+  sfcc_status rc = sfcc_describe(c, sobject, &body);
+  if(rc != SFCC_OK){
+    int r = report(c, rc);
+    free(body);
+    return r;
+  }
+
+  /* --raw is the one-line form every command uses; --json is this response
+   * indented, which is what `describe` printed before the tables existed and is
+   * what anyone piping it into jq still wants. */
+  if(g_raw_output || opt->json){
+    print_json(body);
+    free(body);
+    return 0;
+  }
+
+  cJSON* root = cJSON_ParseWithLength(body, strlen(body));
+  free(body);
+  if(root == NULL){
+    fprintf(stderr, SFCC_PROGNAME ": could not parse the response\n");
+    return 1;
+  }
+
+  int rc_out = 0;
+
+  /* --- fields ------------------------------------------------------------ */
+  const cJSON* fields = cJSON_GetObjectItemCaseSensitive(root, "fields");
+  const int nfields = cJSON_IsArray(fields) ? cJSON_GetArraySize(fields) : 0;
+  /* One scratch per field, allocated up front: the table borrows the cells, so
+   * they have to stay put for as long as the table does. */
+  describe_field_buf* bufs = nfields > 0
+    ? calloc((size_t)nfields, sizeof(*bufs)) : NULL;
+  if(nfields > 0 && bufs == NULL){
+    fprintf(stderr, SFCC_PROGNAME ": out of memory\n");
+    cJSON_Delete(root);
+    return 1;
+  }
+
+  table tf;
+  table_init(&tf, DESC_FIELD_HEADERS, DESC_FIELD_COLS);
+  int used = 0;
+  int idx = 0;
+  const cJSON* f = NULL;
+  cJSON_ArrayForEach(f, fields){
+    if(!desc_field_wanted(f, opt) || idx >= nfields){
+      continue;
+    }
+    const char* cells[DESC_FIELD_COLS];
+    desc_field_row(f, &bufs[idx], cells);
+    if(!table_push(&tf, cells)){
+      rc_out = 1;
+      break;
+    }
+    ++idx;
+    ++used;
+  }
+
+  table_title("fields", (size_t)used);
+  if(rc_out == 0){
+    table_print(&tf, g_no_header);
+  }
+  table_free(&tf);
+  free(bufs);
+  if(rc_out != 0){
+    fprintf(stderr, SFCC_PROGNAME ": out of memory\n");
+    cJSON_Delete(root);
+    return 1;
+  }
+
+  /* --- child relationships ---------------------------------------------- */
+  const cJSON* kids =
+    cJSON_GetObjectItemCaseSensitive(root, "childRelationships");
+  table tc;
+  table_init(&tc, DESC_CHILD_HEADERS, DESC_CHILD_COLS);
+  size_t nchild = 0;
+  const cJSON* k = NULL;
+  cJSON_ArrayForEach(k, kids){
+    const char* cells[DESC_CHILD_COLS];
+    cells[0] = sfcc_json_str(k, "field", "?");
+    cells[1] = sfcc_json_str(k, "childSObject", "?");
+    cells[2] = sfcc_json_str(k, "relationshipName", NULL);
+    if(cells[2] == NULL){
+      cells[2] = "-";
+    }
+    if(!table_push(&tc, cells)){
+      rc_out = 1;
+      break;
+    }
+    ++nchild;
+  }
+  table_title("child relationships", nchild);
+  if(rc_out == 0){
+    table_print(&tc, g_no_header);
+  }
+  table_free(&tc);
+
+  /* --- record types ------------------------------------------------------ */
+  const cJSON* rts = cJSON_GetObjectItemCaseSensitive(root, "recordTypeInfos");
+  table tr;
+  table_init(&tr, DESC_RT_HEADERS, DESC_RT_COLS);
+  size_t nrt = 0;
+  const cJSON* rt = NULL;
+  cJSON_ArrayForEach(rt, rts){
+    const char* cells[DESC_RT_COLS];
+    cells[0] = sfcc_json_str(rt, "recordTypeId", "?");
+    cells[1] = sfcc_json_str(rt, "name", "?");
+    cells[2] = sfcc_json_str(rt, "developerName", "?");
+    cells[3] = sfcc_json_bool(rt, "active")    ? "yes" : "no";
+    cells[4] = sfcc_json_bool(rt, "master")    ? "yes" : "no";
+    cells[5] = sfcc_json_bool(rt, "available") ? "yes" : "no";
+    cells[6] = sfcc_json_bool(rt, "defaultRecordTypeMapping") ? "yes" : "no";
+    if(!table_push(&tr, cells)){
+      rc_out = 1;
+      break;
+    }
+    ++nrt;
+  }
+  table_title("record types", nrt);
+  if(rc_out == 0){
+    table_print(&tr, g_no_header);
+  }
+  table_free(&tr);
+
+  cJSON_Delete(root);
+  return rc_out ? 1 : 0;
 }
 
 static int cmd_versions(sfcc_client* c){
@@ -772,8 +1137,10 @@ int main(int argc, char** argv){
   sfcc_deploy_options_defaults(&dopts);
 
   /* sobjects options */
-  sobjects_opts sopts = { .custom_only = 0, .no_header = 0,
-                          .limit = 0, .filter = NULL };
+  sobjects_opts sopts = { .custom_only = 0, .limit = 0, .filter = NULL };
+
+  /* describe options */
+  describe_opts dopts_desc = { .json = 0, .field_filter = NULL };
 
   /* rest options */
   const char* rest_method = NULL;
@@ -874,10 +1241,14 @@ int main(int argc, char** argv){
       insecure = 1;
     }else if(strcmp(name, "--zip") == 0){
       NEEDS_VALUE(zip_path);
+    }else if(strcmp(name, "--json") == 0){
+      dopts_desc.json = 1;
+    }else if(strcmp(name, "--field") == 0){
+      NEEDS_VALUE(dopts_desc.field_filter);
     }else if(strcmp(name, "--custom") == 0){
       sopts.custom_only = 1;
     }else if(strcmp(name, "--no-header") == 0){
-      sopts.no_header = 1;
+      g_no_header = 1;
     }else if(strcmp(name, "--filter") == 0){
       NEEDS_VALUE(sopts.filter);
     }else if(strcmp(name, "--limit") == 0){
@@ -1156,14 +1527,7 @@ int main(int argc, char** argv){
       fprintf(stderr, SFCC_PROGNAME ": describe needs an object name\n");
       rc = 2;
     }else{
-      char* body = NULL;
-      st = sfcc_describe(c, args[0], &body);
-      if(st != SFCC_OK){
-        rc = report(c, st);
-      }else{
-        print_json(body);
-        free(body);
-      }
+      rc = cmd_describe(c, args[0], &dopts_desc);
     }
   }else{
     fprintf(stderr, SFCC_PROGNAME ": unknown command '%s' (try --help)\n", cmd);
