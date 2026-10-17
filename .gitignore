@@ -4,6 +4,10 @@ install/
 compile_commands.json
 CMakeUserPresets.json
 
+# Python bytecode, from the end-to-end harness
+__pycache__/
+*.pyc
+
 # editor / OS noise
 *.swp
 *~

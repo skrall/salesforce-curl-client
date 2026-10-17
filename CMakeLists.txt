@@ -33,10 +33,37 @@ option(SFCC_WERROR "Treat warnings as errors" OFF)
 #
 # Windows: nothing is bundled. Use vcpkg, which supplies both libcurl and its
 # dependencies:
-#     vcpkg install curl:x64-windows-static-md
+#     vcpkg install curl:x64-windows
 #     cmake -B build -DCMAKE_TOOLCHAIN_FILE=<vcpkg>/scripts/buildsystems/vcpkg.cmake
-# The static-md triplet is the one to prefer. See the CURL_STATICLIB note
-# below for why the choice of triplet is not cosmetic.
+#
+# Prefer the default dynamic triplet over x64-windows-static-md. The static one
+# produces a self-contained sfcc.exe with no libcurl.dll to ship, which is a real
+# advantage -- but it renames zlib's library to zs.lib, which CMake's FindZLIB
+# does not search for unless told to, and it needs CURL_STATICLIB defined for
+# libcurl's headers to link statically rather than as __declspec(dllimport).
+# Both are handled below. CI builds the dynamic triplet anyway: it is the
+# path vcpkg supports most directly, and it keeps the Windows job testing
+# something we can actually keep green.
+
+# vcpkg's zlib, built as a static library on Windows, installs zs.lib and
+# zsd.lib. Those are the names zlib's own CMake build produces when only a
+# static library is requested, and FindZLIB only searches for them when
+# ZLIB_USE_STATIC_LIBS is set -- otherwise it looks for zlib.lib, does not find
+# it, and reports "missing: ZLIB_LIBRARY" having already found the header and
+# read its version. That reads like a broken install rather than a naming
+# difference.
+#
+# Gated on vcpkg rather than applied unconditionally: a system zlib on Linux is
+# libz.so and must keep the default search. vcpkg's toolchain exports
+# VCPKG_TARGET_TRIPLET but not VCPKG_LIBRARY_LINKAGE, so the triplet name is
+# what we key on.
+set(SFCC_VCPKG_STATIC OFF)
+if(DEFINED VCPKG_TARGET_TRIPLET AND VCPKG_TARGET_TRIPLET MATCHES "static")
+  set(SFCC_VCPKG_STATIC ON)
+endif()
+if(SFCC_VCPKG_STATIC)
+  set(ZLIB_USE_STATIC_LIBS ON)
+endif()
 
 find_package(CURL REQUIRED)
 
@@ -58,10 +85,14 @@ endif()
 # mentioning __imp_curl_easy_init, which is a genuinely confusing first
 # experience with vcpkg. CMake's FindCURL already defines CURL_STATICLIB when it
 # detects a static library; this covers the paths where it does not.
-if(WIN32 AND NOT BUILD_SHARED_LIBS)
+if(WIN32 AND (NOT BUILD_SHARED_LIBS OR SFCC_VCPKG_STATIC))
   if(TARGET CURL::libcurl)
     get_target_property(_sfcc_curl_type CURL::libcurl TYPE)
-    if(_sfcc_curl_type STREQUAL "STATIC_LIBRARY")
+    # A vcpkg static triplet settles the linkage regardless of how the imported
+    # target reports itself, and UNKNOWN_LIBRARY is a common way for a config
+    # package to describe a static library. Trust the triplet over the type
+    # rather than silently skipping the define and failing to link later.
+    if(_sfcc_curl_type STREQUAL "STATIC_LIBRARY" OR SFCC_VCPKG_STATIC)
       target_compile_definitions(CURL::libcurl INTERFACE CURL_STATICLIB)
     endif()
   endif()
@@ -70,6 +101,10 @@ endif()
 # --- warnings ---------------------------------------------------------------
 if(MSVC)
   set(SFCC_WARNINGS /W4 /permissive-)
+  # _CRT_SECURE_NO_WARNINGS silences the "use the _s variants" advice. Nothing
+  # else is needed: the two POSIX spellings this code uses, strncasecmp and
+  # strdup, are wrapped in sfcc_strncasecmp and sfcc_strdup rather than borrowed
+  # from the CRT, which does not declare them under _CRT_DECLARE_NONSTDC_NAMES.
   add_compile_definitions(_CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
 else()
   set(SFCC_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wvla -Wcast-qual
@@ -87,7 +122,12 @@ endif()
 # third_party/cjson/README.md means the version is auditable.
 add_library(sfcc_cjson STATIC third_party/cjson/cJSON.c)
 target_include_directories(sfcc_cjson PUBLIC third_party/cjson)
-target_link_libraries(sfcc_cjson PUBLIC m)
+# libm only exists as a separate library on ELF and Mach-O platforms. On
+# Windows the math functions are part of the CRT, and asking for it fails the
+# link with "cannot open input file 'm.lib'".
+if(NOT MSVC)
+  target_link_libraries(sfcc_cjson PUBLIC m)
+endif()
 if(NOT MSVC)
   # cJSON is third-party code we do not control the style of; warning flags on
   # it produce noise that would drown out warnings about ours.
@@ -116,7 +156,19 @@ target_compile_options(sfcc PRIVATE ${SFCC_WARNINGS})
 
 # --- the executable ---------------------------------------------------------
 add_executable(sfcc_cli src/main.c)
+# The binary is named sfcc, the same as the static library, because that is what
+# both are called everywhere else and the library is an implementation detail of
+# it.
 set_target_properties(sfcc_cli PROPERTIES OUTPUT_NAME sfcc)
+# MSVC's linker emits an import library alongside any executable whose output
+# name it knows, and places it in the target's ARCHIVE directory -- which for a
+# multi-config generator is <build>/<config>/sfcc.lib, exactly where the static
+# library above already is. The link then fails with "LNK1149: output filename
+# matches input filename". A command-line tool exports nothing, so the import
+# library is of no use to anyone; give it a directory of its own and the clash
+# disappears. No effect on single-config generators, which do not produce one.
+set_target_properties(sfcc_cli PROPERTIES
+  ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/import")
 target_link_libraries(sfcc_cli PRIVATE sfcc)
 target_compile_options(sfcc_cli PRIVATE ${SFCC_WARNINGS})
 

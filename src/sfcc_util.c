@@ -12,6 +12,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifndef _WIN32
+#include <strings.h>  /* strncasecmp; Windows uses _strnicmp from <string.h> */
+#endif
+
 
 /* ------------------------------------------------------------------------ */
 /* Buffer                                                                   */
@@ -160,6 +164,17 @@ int sfcc_buf_append_encoded(sfcc_buf* b, const char* src){
 /* ------------------------------------------------------------------------ */
 /* Strings                                                                  */
 /* ------------------------------------------------------------------------ */
+
+int sfcc_strncasecmp(const char* a, const char* b, size_t n){
+  if(a == NULL || b == NULL){
+    return (a == b) ? 0 : ((a == NULL) ? -1 : 1);
+  }
+#ifdef _WIN32
+  return _strnicmp(a, b, n);
+#else
+  return strncasecmp(a, b, n);
+#endif
+}
 
 char* sfcc_strdup(const char* s){
   if(s == NULL){

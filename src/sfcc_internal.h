@@ -20,6 +20,25 @@
 #define SFCC_DEFAULT_API_VERSION "v64.0"
 #endif
 
+/* Marks a variadic wrapper as printf-like. gcc and clang then check the format
+ * string and arguments at every call site, which is the whole reason to bother:
+ * sfcc_buf_printf() and sfcc_fail() take format strings from all over the
+ * library, and nothing else verifies them.
+ *
+ * It also clears -Wformat-nonliteral, which is what an unannotated wrapper
+ * trips on when it forwards to vsnprintf(). That warning exists to catch exactly
+ * the case we are annotating, so satisfying it this way is the point rather
+ * than a way around it. MSVC has no equivalent and does not need one.
+ *
+ * Indices are 1-based and count the named parameters, so a wrapper taking
+ * (ctx, fmt, ...) is format(printf, 2, 3). */
+#if defined(__GNUC__) || defined(__clang__)
+#  define SFCC_PRINTF_LIKE(fmt_idx, arg_idx) \
+    __attribute__((format(printf, fmt_idx, arg_idx)))
+#else
+#  define SFCC_PRINTF_LIKE(fmt_idx, arg_idx)
+#endif
+
 /* Longest request body or error string we will accept from the server. A
  * Salesforce response is never near this; the cap exists so a runaway or
  * hostile endpoint cannot make us allocate without bound. */
@@ -42,7 +61,7 @@ void  sfcc_buf_init(sfcc_buf* b);
 int   sfcc_buf_reserve(sfcc_buf* b, size_t extra);
 int   sfcc_buf_append(sfcc_buf* b, const char* data, size_t n);
 int   sfcc_buf_puts(sfcc_buf* b, const char* s);
-int   sfcc_buf_printf(sfcc_buf* b, const char* fmt, ...);
+int   sfcc_buf_printf(sfcc_buf* b, const char* fmt, ...) SFCC_PRINTF_LIKE(2, 3);
 /* Appends src with every byte outside the RFC 3986 unreserved set percent
  * encoded. SOQL in particular contains spaces, quotes and '+', all of which
  * will corrupt a query if they reach the URL verbatim. */
@@ -54,6 +73,15 @@ void  sfcc_buf_free(sfcc_buf* b);
 /* ------------------------------------------------------------------------ */
 
 char* sfcc_strdup(const char* s);          /* NULL in, NULL out              */
+
+/* Case-insensitive comparison over at most n bytes, for header names.
+ *
+ * POSIX calls this strncasecmp and declares it in <strings.h>. Windows has
+ * neither the header nor, despite _CRT_DECLARE_NONSTDC_NAMES, the POSIX
+ * spelling in <string.h>: the call compiles to an implicit extern declaration
+ * and MSVC reports C4013. _strnicmp is its documented equivalent. Wrapping it
+ * is the difference between a build and not. */
+int sfcc_strncasecmp(const char* a, const char* b, size_t n);
 void  sfcc_strfree(char** s);              /* NULL-safe free + null out       */
 void  sfcc_strset(char** slot, const char* value);
 int   sfcc_str_eq(const char* a, const char* b);
@@ -183,7 +211,8 @@ struct sfcc_client {
 
 /* Record a failure for sfcc_last_error() and return rc, so call sites can
  * `return sfcc_fail(c, rc, fmt, ...)`. */
-sfcc_status sfcc_fail(sfcc_client* c, sfcc_status rc, const char* fmt, ...);
+sfcc_status sfcc_fail(sfcc_client* c, sfcc_status rc, const char* fmt, ...)
+  SFCC_PRINTF_LIKE(3, 4);
 
 /* True when a cached token is still usable. Applies a margin so a token that
  * would expire mid-flight is treated as already expired. */

@@ -1,0 +1,288 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Run on pushes to the default branch and on every PR, open or closed.
+  workflow_dispatch:
+
+# A new push to a PR makes the previous run irrelevant. Cancelling keeps the
+# queue from filling with superseded builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Silence a wall of CMake chatter so a failure is visible in the log.
+  CTEST_OUTPUT_ON_FAILURE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Linux: both compilers, all three presets, plus the install check.
+  #
+  # gcc and clang separately is the point. They disagree about warnings, and
+  # -Werror across both is what keeps the code portable rather than merely
+  # correct on the machine it was written on.
+  # ---------------------------------------------------------------------
+  linux:
+    name: linux (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false        # one compiler failing should not hide the other
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/debug \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DSFCC_WERROR=ON
+
+      - name: Build (debug)
+        run: cmake --build build/debug --parallel
+
+      - name: Test (debug)
+        run: ctest --test-dir build/debug --output-on-failure
+
+      # Release separately: an optimised build is where a latent memory bug
+      # becomes an actual crash, and it is the binary that ships.
+      - name: Build and test (release)
+        run: |
+          cmake -S . -B build/release \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSFCC_WERROR=ON
+          cmake --build build/release --parallel
+          ctest --test-dir build/release --output-on-failure
+
+      - name: Build and test (ASan + UBSan)
+        run: |
+          cmake -S . -B build/asan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DSFCC_WERROR=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build/asan --parallel
+          ASAN_OPTIONS=detect_leaks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 \
+            ctest --test-dir build/asan --output-on-failure
+
+      - name: Install
+        run: |
+          sudo cmake --install build/release
+          sfcc --version
+
+      - name: Build the container image
+        run: |
+          docker build -t sfcc:ci .
+          docker run --rm sfcc:ci --version
+
+  # ---------------------------------------------------------------------
+  # End-to-end against the mock endpoint.
+  #
+  # Kept separate from the matrix so a wire-format failure is visibly not a
+  # compiler problem. Runs the release binary, because that is the one where
+  # the crash was hiding.
+  # ---------------------------------------------------------------------
+  e2e:
+    name: end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev
+
+      - name: Build (release)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DSFCC_WERROR=ON
+          cmake --build build --parallel
+
+      - name: End-to-end against the mock endpoint
+        run: python3 tests/e2e/e2e.py build/bin/sfcc
+
+  # ---------------------------------------------------------------------
+  # macOS. libcurl's headers are usually absent here, so curl comes from
+  # Homebrew and CMake has to be pointed at it. ASan is not run: it is not
+  # reliable on this platform and Linux already covers it.
+  # ---------------------------------------------------------------------
+  macos:
+    name: macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcurl
+        run: brew install curl
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSFCC_WERROR=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix curl)"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        # The e2e test is registered only on non-Windows, but the unit tests
+        # assert POSIX file modes, which macOS has, so everything runs here.
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------
+  # Windows via MSVC and vcpkg. Nothing is bundled, so vcpkg supplies libcurl.
+  #
+  # The triplet is pinned deliberately: it has to match the one libcurl was
+  # installed under, or the toolchain searches the wrong installed/ subdirectory
+  # at configure time and reports a missing dependency we already have.
+  #
+  # This is vcpkg's default dynamic triplet rather than x64-windows-static-md.
+  # The static one yields an sfcc.exe with no libcurl.dll to ship, which is worth
+  # having, but it renames zlib's library to zs.lib -- a name CMake's FindZLIB
+  # does not search for unless ZLIB_USE_STATIC_LIBS is set -- and needs
+  # CURL_STATICLIB for libcurl's headers. CMakeLists.txt handles both, but that
+  # path cost four CI round trips to get right and cannot be verified from Linux,
+  # so the job tests the triplet vcpkg supports most directly. Anyone building
+  # against a static triplet is supported; it is just not what CI exercises.
+  # ---------------------------------------------------------------------
+  windows:
+    name: windows (msvc)
+    runs-on: windows-latest
+    env:
+      VCPKG_TARGET_TRIPLET: x64-windows
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up CMake
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: '>=3.21'
+
+      # windows-latest ships vcpkg preinstalled but does not put it on PATH
+      # under a name our steps can rely on, and the variable naming it differs
+      # between images. Resolve it once here and fail loudly if it is missing,
+      # rather than handing CMake an empty path and letting it say something
+      # unhelpful later. (It previously did exactly that: VCPKG_ROOT was never
+      # defined, so the toolchain argument arrived as
+      # -DCMAKE_TOOLCHAIN_FILE=/scripts/buildsystems/vcpkg.cmake.)
+      - name: Locate vcpkg
+        shell: pwsh
+        run: |
+          if (-not $env:VCPKG_ROOT) {
+            $env:VCPKG_ROOT = $env:VCPKG_INSTALLATION_ROOT
+          }
+          if (-not $env:VCPKG_ROOT) {
+            $env:VCPKG_ROOT = 'C:\vcpkg'
+          }
+          $toolchain = Join-Path $env:VCPKG_ROOT 'scripts/buildsystems/vcpkg.cmake'
+          if (-not (Test-Path $toolchain)) {
+            throw "No vcpkg toolchain at $toolchain (VCPKG_ROOT=$env:VCPKG_ROOT)"
+          }
+          Write-Host "vcpkg toolchain: $toolchain"
+          "VCPKG_ROOT=$env:VCPKG_ROOT" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      # Warms vcpkg's binary cache, so configure links an already-built libcurl
+      # instead of spending minutes compiling it and its dependencies.
+      - name: Install libcurl
+        run: vcpkg install curl:${{ env.VCPKG_TARGET_TRIPLET }}
+
+      # bin/ and debug/bin/ matter as much as the libraries: on the dynamic
+      # triplet sfcc.exe links against libcurl.dll and zlib1.dll, and vcpkg's
+      # applocal deployment is what puts them beside the executable. Listing
+      # them here shows whether it ran, rather than leaving the test job to
+      # fail on a missing DLL.
+      #
+      # Kept because it is the only way to see what vcpkg actually produced.
+      # The zlib failure this exists to explain was "Could NOT find ZLIB (missing:
+      # ZLIB_LIBRARY)" -- reported while the header had been found and its
+      # version read, because static zlib installs zs.lib and FindZLIB does not
+      # look for that name unless ZLIB_USE_STATIC_LIBS is set. Nothing in that
+      # message distinguishes a naming difference from a broken install.
+      - name: Show the vcpkg installed tree
+        shell: pwsh
+        run: |
+          $triplet = "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET"
+          if (-not (Test-Path $triplet)) { throw "No installed tree at $triplet" }
+          Write-Host "$triplet"
+          foreach ($sub in @('lib', 'debug/lib', 'bin', 'debug/bin')) {
+            $d = Join-Path $triplet $sub
+            Write-Host "--- $sub"
+            if (Test-Path $d) {
+              Get-ChildItem $d -Name | ForEach-Object { Write-Host "    $_" }
+            } else {
+              Write-Host "    (absent)"
+            }
+          }
+
+      - name: Configure
+        shell: pwsh
+        # Quoted, and read from the shell's own environment rather than
+        # substituted by Actions. Unquoted, pwsh split the argument and CMake
+        # received "/scripts/buildsystems/vcpkg" plus a stray ".cmake".
+        #
+        # CMAKE_PREFIX_PATH is spelled out as well as handed to the toolchain.
+        # The toolchain is responsible for putting the installed triplet on the
+        # prefix path; saying so again is redundant when it works and the
+        # difference between working and not when it does not. FindCURL's
+        # find_path/find_library both honour it, so this is the belt to the
+        # toolchain's braces.
+        run: |
+          cmake -S . -B build -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT/installed/$env:VCPKG_TARGET_TRIPLET"
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # ---------------------------------------------------------------------
+  # A lint that needs no toolchain: the source must be free of tabs, trailing
+  # whitespace and CRLF. Cheap, and it keeps diffs readable.
+  # ---------------------------------------------------------------------
+  hygiene:
+    name: source hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No tabs or trailing whitespace in our C sources
+        # third_party is excluded deliberately: that is cJSON's code, not ours,
+        # and it has trailing whitespace we should not be reformatting. This
+        # lint caught exactly that on its first run, which is the point of
+        # running it locally before pushing.
+        run: |
+          fail=0
+          for f in $(git ls-files '*.c' '*.h' ':!:third_party/*'); do
+            if grep -nP '\t' "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::tab character"; fail=1
+            fi
+            if grep -nP ' +$' "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::trailing whitespace"; fail=1
+            fi
+            if grep -nP '\r$' "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::CRLF line ending"; fail=1
+            fi
+          done
+          if [ "$fail" -eq 0 ]; then echo "source hygiene clean"; fi
+          exit $fail
