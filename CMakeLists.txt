@@ -101,7 +101,13 @@ endif()
 # --- warnings ---------------------------------------------------------------
 if(MSVC)
   set(SFCC_WARNINGS /W4 /permissive-)
-  add_compile_definitions(_CRT_SECURE_NO_WARNINGS UNICODE _UNICODE)
+  # _CRT_SECURE_NO_WARNINGS silences the "use the _s variants" advice.
+  # _CRT_DECLARE_NONSTDC_NAMES is what makes <string.h> declare the POSIX
+  # spellings -- strncasecmp among them. MSVC has them but hides them by
+  # default, and there is no <strings.h> to fall back on, so without this the
+  # build stops at "Cannot open include file: 'strings.h'".
+  add_compile_definitions(_CRT_SECURE_NO_WARNINGS _CRT_DECLARE_NONSTDC_NAMES
+                          UNICODE _UNICODE)
 else()
   set(SFCC_WARNINGS -Wall -Wextra -Wpedantic -Wshadow -Wvla -Wcast-qual
                     -Wwrite-strings -Wformat=2 -Wundef)

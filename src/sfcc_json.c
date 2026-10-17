@@ -92,10 +92,11 @@ void sfcc_json_describe_error(const char* body, long status, char* out,
     cJSON* root = cJSON_ParseWithLength(body, strlen(body));
     if(root != NULL){
       if(cJSON_IsArray(root)){
-        /* REST style: a one-element array in practice, but iterate anyway
-         * rather than assuming the length. */
-        const cJSON* first = NULL;
-        cJSON_ArrayForEach(first, root){ break; }
+        /* First element only. Taking the child directly rather than
+         * iterating: cJSON_ArrayForEach's increment expression is unreachable
+         * after a break, which MSVC reports as C4702 and /WX turns into a build
+         * failure. One child is all this is ever for. */
+        const cJSON* first = (root->child != NULL) ? root->child : NULL;
         if(first != NULL){
           char raw[SFCC_ERRLEN_MAX];
           snprintf(raw, sizeof(raw), "%s", jstr(first, "errorCode"));

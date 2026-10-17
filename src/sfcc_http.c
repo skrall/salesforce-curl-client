@@ -23,7 +23,9 @@
 
 #include <stdarg.h>
 #include <stdio.h>
-#include <strings.h>   /* strncasecmp */
+#ifndef _WIN32
+#include <strings.h>   /* strncasecmp; MSVC declares it from <string.h> instead */
+#endif
 #include <stdlib.h>
 #include <string.h>
 
