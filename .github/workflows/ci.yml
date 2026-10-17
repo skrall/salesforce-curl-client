@@ -200,13 +200,44 @@ jobs:
       - name: Install libcurl
         run: vcpkg install curl:${{ env.VCPKG_TARGET_TRIPLET }}
 
+      # vcpkg's curl port deliberately ships no CURLConfig.cmake. It is meant to
+      # be consumed through CMake's built-in find_package, which means the
+      # search depends on vcpkg's own wrapper having put the installed tree on
+      # the prefix path. When that does not happen the only symptom is
+      #
+      #   Could NOT find CURL (missing: CURL_LIBRARY CURL_INCLUDE_DIR)
+      #
+      # which says nothing about why. Print what is actually on disk, so the
+      # next failure of this kind is diagnosable from the log alone.
+      - name: Show what vcpkg installed
+        shell: pwsh
+        run: |
+          $triplet = "$env:VCPKG_ROOT\installed\$env:VCPKG_TARGET_TRIPLET"
+          Write-Host "triplet:   $env:VCPKG_TARGET_TRIPLET"
+          Write-Host "installed: $triplet"
+          if (-not (Test-Path $triplet)) { throw "No installed tree at $triplet" }
+          Write-Host "--- curl artefacts actually present:"
+          Get-ChildItem -Path $triplet -Recurse -Include curl.h,curl.lib,libcurl.lib,libcurl.a -ErrorAction SilentlyContinue | ForEach-Object { Write-Host "    $($_.FullName)" }
+          if (Test-Path "$triplet\include\curl\curl.h") {
+            Write-Host "curl headers: present"
+          } else {
+            Write-Host "curl headers: ABSENT"
+          }
+
       - name: Configure
         shell: pwsh
         # Quoted, and read from the shell's own environment rather than
         # substituted by Actions. Unquoted, pwsh split the argument and CMake
         # received "/scripts/buildsystems/vcpkg" plus a stray ".cmake".
+        #
+        # CMAKE_PREFIX_PATH is spelled out as well as handed to the toolchain.
+        # The toolchain is responsible for putting the installed triplet on the
+        # prefix path; saying so again is redundant when it works and the
+        # difference between working and not when it does not. FindCURL's
+        # find_path/find_library both honour it, so this is the belt to the
+        # toolchain's braces.
         run: |
-          cmake -S . -B build -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake"
+          cmake -S . -B build -A x64 "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" "-DCMAKE_PREFIX_PATH=$env:VCPKG_ROOT/installed/$env:VCPKG_TARGET_TRIPLET"
 
       - name: Build
         run: cmake --build build --config Release --parallel
