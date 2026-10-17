@@ -686,6 +686,17 @@ sfcc_status sfcc_describe(sfcc_client* c, const char* sobject, char** out){
   return rc;
 }
 
+sfcc_status sfcc_list_sobjects(sfcc_client* c, char** out){
+  if(c == NULL || out == NULL){
+    return SFCC_ERR_ARG;
+  }
+  *out = NULL;
+  /* The bare collection, not one object's describe. Salesforce answers with a
+   * single document holding every object the org can see, which is why this
+   * cannot be expressed as a repeated per-object call. */
+  return api_call(c, SFCC_HTTP_GET, "sobjects", NULL, out);
+}
+
 sfcc_status sfcc_list_versions(sfcc_client* c, char** out){
   if(c == NULL || out == NULL){
     return SFCC_ERR_ARG;

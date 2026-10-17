@@ -13,6 +13,10 @@
 
 #include "sfcc.h"
 
+/* The JSON accessors below take and return cJSON nodes, so anything including
+ * this header needs the type whether or not it reads JSON itself. */
+#include "cJSON.h"
+
 #include <stddef.h>
 #include <time.h>
 
@@ -174,6 +178,20 @@ void sfcc_json_describe_error(const char* body, long status, char* out,
 
 /* Validate that a response body parses as JSON. */
 int sfcc_json_valid(const char* body);
+
+/* Typed field accessors, shared by every caller that reads a response.
+ *
+ * Each looks a key up case-sensitively and type-checks what it finds, because
+ * Salesforce omits fields freely: a capability flag can arrive as false, be
+ * absent entirely, or be null depending on the object and the API version. An
+ * accessor that assumed presence would report an absent field as true, which
+ * for a capability listing is worse than saying nothing.
+ *
+ * The returned string points into the cJSON tree and is owned by it; it is
+ * valid only while that tree is. */
+const char* sfcc_json_str(const cJSON* o, const char* key, const char* dflt);
+int sfcc_json_bool(const cJSON* o, const char* key);
+int sfcc_json_int(const cJSON* o, const char* key, int fallback);
 
 /* ------------------------------------------------------------------------ */
 /* Client internals                                                         */

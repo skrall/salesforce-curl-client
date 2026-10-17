@@ -142,3 +142,21 @@ void sfcc_json_describe_error(const char* body, long status, char* out,
     snprintf(out, outsz, "no response");
   }
 }
+
+const char* sfcc_json_str(const cJSON* o, const char* key, const char* dflt){
+  const cJSON* f = cJSON_GetObjectItemCaseSensitive(o, key);
+  return (cJSON_IsString(f) && f->valuestring) ? f->valuestring : dflt;
+}
+
+int sfcc_json_bool(const cJSON* o, const char* key){
+  const cJSON* f = cJSON_GetObjectItemCaseSensitive(o, key);
+  /* Absent is not the same as false, but a capability listing has no way to
+   * express "unknown", and reporting an omitted flag as available would be the
+   * more dangerous of the two errors. cJSON_IsTrue covers true, 1 and "true". */
+  return cJSON_IsTrue(f);
+}
+
+int sfcc_json_int(const cJSON* o, const char* key, int fallback){
+  const cJSON* f = cJSON_GetObjectItemCaseSensitive(o, key);
+  return cJSON_IsNumber(f) ? (int)f->valuedouble : fallback;
+}

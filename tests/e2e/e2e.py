@@ -197,6 +197,117 @@ def test_query(c, r):
     r.lacks(blob, '[{"message"', "not printed as a raw json blob")
 
 
+def test_sobjects(c, r):
+    """The sobjects table.
+
+    The renderer is the part worth asserting: a flag that arrives absent, an
+    object with no key prefix, and a label long enough to stretch the columns.
+    All three are in the fixture precisely because a table can get each wrong
+    quietly -- blank cells, a column shift, a header sized to nothing.
+    """
+    r.section("sobjects: the table has headers and one row per object")
+    rc, out, err = c.run("sobjects")
+    if rc == 0:
+        r.ok("sobjects exits 0")
+    else:
+        r.bad("sobjects exits 0", "rc=%d err=%s" % (rc, err))
+
+    first = out.splitlines()[0] if out else ""
+    for col in ("NAME", "LABEL", "PREFIX", "CUST", "CRE", "UPD", "DEL",
+                "UNDEL", "QRY", "RET", "SRCH", "LAY", "MRG", "TRIG"):
+        r.contains(first, col, "header names %s" % col)
+
+    body = [ln for ln in out.splitlines()[1:]
+            if ln and not ln.endswith("objects")]
+    r.check(len(body) == 4, "one row per object",
+            "got %d rows: %r" % (len(body), out))
+    r.contains(out, "4 of 4 objects", "the summary counts what was printed")
+
+    r.section("sobjects: identity columns come from the right fields")
+    r.contains(out, "Account", "platform object listed by API name")
+    r.contains(out, "Invoice__c", "custom object listed by API name")
+    r.contains(out, "Customer Invoice", "label shown, not the API name")
+    r.contains(out, "001", "key prefix shown")
+
+    r.section("sobjects: capability flags render yes and no")
+    # Account is queryable and createable; ContentNote carries no flags at all,
+    # so every one of its cells must read "no" rather than being guessed at.
+    account = next((ln for ln in body if ln.startswith("Account ")), "")
+    notenote = next((ln for ln in body if ln.startswith("ContentNote")), "")
+    a = account.split()
+    n = notenote.split()
+    # 14 columns: name, label, prefix, and eleven flags. A label may contain
+    # spaces, so only rows whose label is one word can be counted this way --
+    # which is why these two are the ones asserted on.
+    r.check(len(a) == 14, "a fully-populated row has all 14 columns",
+            "got %d: %r" % (len(a), account))
+    r.check(a[3:5] == ["no", "yes"],
+            "Account is not custom and is createable", repr(account))
+    r.check(a[-3:] == ["yes", "yes", "yes"],
+            "and the last three flags line up at the right end", repr(account))
+
+    # ContentNote has no keyPrefix, so that column is empty and collapses under
+    # whitespace splitting: 13 fields, not 14. That it is 13 rather than 14 or
+    # 12 is the alignment assertion -- a renderer that skipped or duplicated the
+    # empty cell would show up here.
+    r.check(len(n) == 13, "the row with no key prefix has one fewer field",
+            "got %d: %r" % (len(n), notenote))
+    r.check(n[2:] == ["no"] * 11,
+            "an object with no flags at all reads no for all eleven",
+            repr(notenote))
+    r.check(n[:2] == ["ContentNote", "Note"],
+            "and its identity columns are not displaced by the missing prefix",
+            repr(notenote))
+
+    r.section("sobjects: --custom keeps only custom objects")
+    rc, out, err = c.run("sobjects", "--custom")
+    r.check(rc == 0, "--custom exits 0", err)
+    r.contains(out, "Invoice__c", "the custom object is kept")
+    r.lacks(out, "Account ", "a platform object is dropped")
+    r.contains(out, "1 of 4 objects", "the summary reflects the filter")
+
+    r.section("sobjects: --filter matches name or label, ignoring case")
+    rc, out, err = c.run("sobjects", "--filter", "invoice")
+    r.check(rc == 0, "--filter exits 0", err)
+    r.contains(out, "Invoice__c", "matched on the API name")
+
+    rc, out, err = c.run("sobjects", "--filter", "INVOICE")
+    r.contains(out, "Invoice__c", "the match is case-insensitive")
+
+    rc, out, err = c.run("sobjects", "--filter", "Customer Invoice")
+    r.contains(out, "Invoice__c", "matched on the label")
+
+    rc, out, err = c.run("sobjects", "--filter", "zzzznomatch")
+    r.check(rc != 0, "no match exits nonzero", "rc=%d out=%s" % (rc, out))
+    r.contains(err, "no objects matched",
+               "and says so rather than printing nothing")
+
+    r.section("sobjects: --limit and --no-header")
+    rc, out, err = c.run("sobjects", "--limit", "2")
+    r.check(rc == 0, "--limit exits 0", err)
+    rows = [ln for ln in out.splitlines()[1:]
+            if ln and not ln.endswith("objects")]
+    r.check(len(rows) == 2, "--limit caps the row count", "got %d" % len(rows))
+    r.contains(out, "2 of 4 objects", "the summary shows the cap and the total")
+
+    rc, out, err = c.run("sobjects", "--no-header")
+    r.check(rc == 0, "--no-header exits 0", err)
+    r.lacks(out, "PREFIX", "the header line is gone")
+    r.contains(out, "Account", "the rows are still there")
+
+    r.section("sobjects: --raw prints the response instead of the table")
+    rc, out, err = c.run("sobjects", "--raw")
+    r.check(rc == 0, "--raw exits 0", err)
+    r.contains(out, '"sobjects"', "the wrapper object is present")
+    r.contains(out, '"customSetting"', "flags the table omits are still there")
+    r.lacks(out, "NAME", "no table header in raw mode")
+
+    r.section("sobjects: arguments are rejected")
+    rc, out, err = c.run("sobjects", "Account")
+    r.check(rc != 0, "a stray argument exits nonzero", "rc=%d" % rc)
+    r.contains(err, "describe", "and points at the command that does take one")
+
+
 def test_records(c, r):
     r.section("get / create / update / delete")
     rc, out, err = c.run("get", "Account", "001000000000000AAA")
@@ -448,7 +559,8 @@ def test_transport_errors(c, r):
 
 # --------------------------------------------------------------------------
 
-ALL = [test_auth, test_query, test_records, test_validation, test_rest,
+ALL = [test_auth, test_query, test_sobjects, test_records,
+       test_validation, test_rest,
        test_binary_output, test_stdio, test_deploy, test_transport_errors]
 
 

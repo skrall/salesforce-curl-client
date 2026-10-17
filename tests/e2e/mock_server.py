@@ -42,6 +42,46 @@ DEPLOY_ID = "0Af1B000000DeployAAA"
 # body as a C string. The length is asserted, not just the prefix.
 BLOB = b"\x89PNG\r\n\x1a\n\x00\x01\x02binary-blob"
 
+# The global SObject listing, shaped like the real one: a wrapper object with
+# "sobjects" inside it, not a bare array.
+#
+# Deliberately awkward in four places, because each one is a way a table
+# renderer can quietly get something wrong:
+#
+#   * Invoice__c is custom, so --custom has something to select.
+#   * ContentNote has no keyPrefix at all, and no capability flags either --
+#     Salesforce omits fields freely, so "absent" must render rather than crash
+#     or be mistaken for true.
+#   * PlatformEvent__e is long-named with a long label, so column widths are
+#     driven by content rather than by the header.
+#   * Account has keyPrefix out of alphabetical order, so a renderer that sorts
+#     by the wrong column or drops a field shows up immediately.
+SOBJECTS = {
+    "encoding": "UTF-8",
+    "maxBatchSize": 200,
+    "sobjects": [
+        {"name": "Account", "label": "Account", "labelPlural": "Accounts",
+         "keyPrefix": "001", "createable": True, "custom": False,
+         "deletable": True, "layoutable": True, "mergeable": True,
+         "queryable": True, "retrieveable": True, "searchable": True,
+         "triggerable": True, "undeletable": True, "updateable": True},
+        {"name": "Invoice__c", "label": "Customer Invoice",
+         "labelPlural": "Customer Invoices", "keyPrefix": "inv",
+         "createable": True, "custom": True, "customSetting": False,
+         "deletable": True, "layoutable": True, "mergeable": False,
+         "queryable": True, "retrieveable": True, "searchable": True,
+         "triggerable": True, "undeletable": True, "updateable": True},
+        # No keyPrefix, and no flags: every capability must read as "no" and
+        # the prefix as empty, without a crash or a stray blank column.
+        {"name": "ContentNote", "label": "Note", "labelPlural": "Notes"},
+        {"name": "PlatformEvent__e",
+         "label": "Platform Event for the Long Column Test",
+         "labelPlural": "Platform Events", "keyPrefix": "evt",
+         "createable": True, "custom": False, "deletable": True,
+         "queryable": True, "retrieveable": True, "undeletable": True},
+    ],
+}
+
 
 class _State:
     """Per-server state, kept off the handler so tests can inspect it."""
@@ -171,6 +211,9 @@ class Handler(BaseHTTPRequestHandler):
                      "Id": "001000000000000AAB", "Name": "O'Brien & Co"},
                 ],
             })
+
+        if self._path_is("/services/data/{version}/sobjects"):
+            return self._send_json(200, SOBJECTS)
 
         if self._path_is("/services/data/{version}/sobjects/Account/001000000000000AAA"):
             return self._send_json(200, {"Id": "001000000000000AAA",

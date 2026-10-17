@@ -34,8 +34,15 @@ static int g_quiet = 0;
 
 /* ------------------------------------------------------------------------ */
 
+/* Emitted as a sequence of fputs rather than one fprintf.
+ *
+ * A single string literal has to fit inside what ISO C guarantees -- 4095
+ * characters after concatenation -- and the help text had reached 4228, which
+ * gcc rejects under -Werror as -Woverlength-strings. Chunking it is the fix
+ * rather than trimming the help or suppressing the warning, since the text is
+ * only going to grow. */
 static void usage(FILE* out){
-  fprintf(out,
+  fputs(
 "Usage: " SFCC_PROGNAME " [options] <command> [arguments]\n"
 "\n"
 "A minimal Salesforce REST client.\n"
@@ -49,6 +56,7 @@ static void usage(FILE* out){
 "  update <object> <id> <json> update a record\n"
 "  delete <object> <id>        delete a record\n"
 "  describe <object>           object metadata: fields and types\n"
+"  sobjects                    every object in the org, as a table\n"
 "  versions                    API versions this org supports\n"
 "  deploy --zip <file>         deploy a prebuilt metadata package\n"
 "  rest <path>                 one raw REST call, with auth applied\n"
@@ -56,14 +64,38 @@ static void usage(FILE* out){
 "Options:\n"
 "  --instance <url>            org base URL, e.g. https://acme.my.salesforce.com\n"
 "  --token <token>             use this access token instead of OAuth\n"
-"  --api-version <v64.0>       API version (default %s)\n"
+"  --api-version <v64.0>       API version (default ", out);
+  fprintf(out, "%s", SFCC_DEFAULT_API_VERSION);
+  fputs(
+")\n"
 "  --login-url <url>           token endpoint (default https://login.salesforce.com)\n"
 "  --token-cache <path>        where to memoise the token\n"
 "  --no-cache                  do not read or write the token cache\n"
-"  --timeout <seconds>         whole-transfer timeout (default %ld)\n"
+"  --timeout <seconds>         whole-transfer timeout (default ", out);
+  fprintf(out, "%ld", 60L);
+  fputs(
+")\n"
 "  --raw                       print JSON on one line instead of indented\n"
 "  --quiet                     suppress the trailing status line\n"
 "  --insecure-skip-verify      DANGER: disable TLS certificate checks\n"
+"\n"
+"sobjects options:\n"
+"  --raw                       print the API response instead of the table\n"
+"  --custom                    only custom objects, skipping the platform ones\n"
+"  --filter <text>             keep objects whose name or label contains <text>\n"
+"  --limit <n>                 show at most <n> objects\n"
+"  --no-header                 omit the column header line\n"
+"\n"
+"Sobject table columns:\n"
+"  NAME      object API name, as used in SOQL and in the REST paths\n"
+"  LABEL     the object's display name\n"
+"  PREFIX    key prefix, the leading characters of every one of its ids\n"
+"  CUST      custom, i.e. added to the org rather than supplied by Salesforce\n"
+"  CRE       createable      UPD     updateable    DEL    deletable\n"
+"  UNDEL     undeletable    QRY     queryable     RET    retrieveable\n"
+"  SRCH      searchable      LAY     layoutable    MRG    mergeable\n"
+"  TRIG      triggerable\n"
+"  Salesforce reports more flags than these; --raw prints all of them.\n"
 "\n"
 "Deploy options:\n"
 "  --validate-only             check the package without changing anything\n"
@@ -103,8 +135,9 @@ static void usage(FILE* out){
 "  " SFCC_PROGNAME " create Account '{\"Name\":\"Acme\",\"Industry\":\"Tech\"}'\n"
 "  " SFCC_PROGNAME " update Account 001000000000000AAA '{\"Phone\":\"555-0100\"}'\n"
 "\n"
-"  " SFCC_PROGNAME " deploy --validate-only --test-level local ./package.zip\n",
-          SFCC_DEFAULT_API_VERSION, 60L);
+"  " SFCC_PROGNAME " sobjects --custom --filter invoice\n"
+"\n"
+"  " SFCC_PROGNAME " deploy --validate-only --test-level local ./package.zip\n", out);
 }
 
 static void version(void){
@@ -483,6 +516,208 @@ static int cmd_rest(sfcc_client* c, const char* path, const rest_args* a){
   return failed;
 }
 
+/* ------------------------------------------------------------------------ */
+/* sobjects                                                                  */
+/* ------------------------------------------------------------------------ */
+
+/* The capability flags Salesforce reports per object, in the order shown.
+ *
+ * The API returns more than this -- customSetting, deprecatedAndHidden,
+ * feedEnabled, hasSubtypes, isSubtype, mruEnabled and replicateable among them.
+ * Those are left out because they answer questions asked far less often than
+ * "can I write to this", and every extra column costs width in a table that is
+ * already wide. --raw prints the response with all of them, so nothing is
+ * actually unavailable; it is only unlisted. */
+static const char* const SOBJ_HEADERS[] = {
+  "NAME", "LABEL", "PREFIX",
+  "CUST", "CRE", "UPD", "DEL", "UNDEL", "QRY", "RET", "SRCH", "LAY", "MRG", "TRIG",
+};
+enum { SOBJ_COLS = (int)(sizeof(SOBJ_HEADERS) / sizeof(SOBJ_HEADERS[0])) };
+
+typedef struct {
+  int  custom_only;   /* --custom: platform objects are the majority and rarely
+                       * what someone is looking for */
+  int  no_header;     /* --no-header */
+  long limit;         /* --limit, 0 for all */
+  const char* filter; /* --filter, matched against name and label */
+} sobjects_opts;
+
+/* Case-insensitive substring test. POSIX has strcasestr; MSVC does not, and
+ * this is the only place the client would want one. */
+static int contains_ci(const char* hay, const char* needle){
+  if(needle == NULL || *needle == '\0'){
+    return 1;
+  }
+  if(hay == NULL){
+    return 0;
+  }
+  for(const char* p = hay ; *p != '\0' ; ++p){
+    size_t i = 0;
+    while(needle[i] != '\0' && p[i] != '\0' &&
+          sfcc_strncasecmp(p + i, needle + i, 1) == 0){
+      ++i;
+    }
+    if(needle[i] == '\0'){
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* Fill one row of cell pointers from one SObject.
+ *
+ * The strings point into the parsed tree, which outlives the printing. An
+ * absent flag becomes "no" rather than a blank: a capability table with holes in
+ * it is harder to scan than one that is pessimistic. */
+static void sobject_row(const cJSON* o, const char** cells){
+  cells[0] = sfcc_json_str(o, "name", "");
+  cells[1] = sfcc_json_str(o, "label", "");
+  cells[2] = sfcc_json_str(o, "keyPrefix", "");
+  cells[3] = sfcc_json_bool(o, "custom")        ? "yes" : "no";
+  cells[4] = sfcc_json_bool(o, "createable")    ? "yes" : "no";
+  cells[5] = sfcc_json_bool(o, "updateable")    ? "yes" : "no";
+  cells[6] = sfcc_json_bool(o, "deletable")     ? "yes" : "no";
+  cells[7] = sfcc_json_bool(o, "undeletable")   ? "yes" : "no";
+  cells[8] = sfcc_json_bool(o, "queryable")     ? "yes" : "no";
+  cells[9] = sfcc_json_bool(o, "retrieveable")  ? "yes" : "no";
+  cells[10] = sfcc_json_bool(o, "searchable")   ? "yes" : "no";
+  cells[11] = sfcc_json_bool(o, "layoutable")   ? "yes" : "no";
+  cells[12] = sfcc_json_bool(o, "mergeable")    ? "yes" : "no";
+  cells[13] = sfcc_json_bool(o, "triggerable")  ? "yes" : "no";
+}
+
+/* Decide whether one object survives the --custom and --filter options. Kept
+ * apart from sobject_row so filtering never touches the output cells. */
+static int sobject_wanted(const cJSON* o, const sobjects_opts* opt){
+  if(opt->custom_only && !sfcc_json_bool(o, "custom")){
+    return 0;
+  }
+  if(opt->filter != NULL){
+    return contains_ci(sfcc_json_str(o, "name", ""), opt->filter) ||
+           contains_ci(sfcc_json_str(o, "label", ""), opt->filter);
+  }
+  return 1;
+}
+
+/* Print one row, padded to the measured column widths. */
+static void print_row(const char* const* cells, const int* widths){
+  for(int i = 0 ; i < SOBJ_COLS ; ++i){
+    if(i > 0){
+      fputs("  ", stdout);
+    }
+    fputs(cells[i], stdout);
+    if(i + 1 < SOBJ_COLS){
+      for(int pad = (int)strlen(cells[i]) ; pad < widths[i] ; ++pad){
+        fputc(' ', stdout);
+      }
+    }
+  }
+  fputc('\n', stdout);
+}
+
+static int cmd_sobjects(sfcc_client* c, const sobjects_opts* opt){
+  char* body = NULL;
+  sfcc_status rc = sfcc_list_sobjects(c, &body);
+  if(rc != SFCC_OK){
+    int r = report(c, rc);
+    free(body);
+    return r;
+  }
+
+  /* --raw means the response itself, which is what every other command does
+   * with a body and what anyone scripting this one wants. */
+  if(g_raw_output){
+    print_json(body);
+    free(body);
+    return 0;
+  }
+
+  cJSON* root = cJSON_ParseWithLength(body, strlen(body));
+  free(body);
+  if(root == NULL){
+    fprintf(stderr, SFCC_PROGNAME ": could not parse the response\n");
+    return 1;
+  }
+
+  const cJSON* arr = cJSON_GetObjectItemCaseSensitive(root, "sobjects");
+  if(!cJSON_IsArray(arr)){
+    /* Not something this client knows how to read, and printing an empty table
+     * without saying why would look like an org with no objects in it. */
+    fprintf(stderr, SFCC_PROGNAME ": response has no \"sobjects\" array;"
+                    " the endpoint may have changed (API %s)\n",
+            SFCC_DEFAULT_API_VERSION);
+    cJSON_Delete(root);
+    return 1;
+  }
+
+  /* Measure the columns over the rows that will actually be printed. Sizing
+   * them against every object in the org instead would pad the header to fit
+   * something -- often only present in a filtered-out row -- that never gets
+   * printed. */
+  int widths[SOBJ_COLS];
+  for(int i = 0 ; i < SOBJ_COLS ; ++i){
+    widths[i] = (int)strlen(SOBJ_HEADERS[i]);
+  }
+
+  int total = cJSON_GetArraySize(arr);
+  int matched = 0;
+
+  const cJSON* o = NULL;
+  cJSON_ArrayForEach(o, arr){
+    if(!sobject_wanted(o, opt)){
+      continue;
+    }
+    /* 'continue' rather than 'break': cJSON_ArrayForEach's increment is
+     * unreachable after a break, which MSVC reports as C4702 and /WX turns
+     * into a build failure. The remainder of the array is only a few hundred
+     * pointer comparisons, so the walk is not worth a warning. */
+    if(opt->limit > 0 && matched >= opt->limit){
+      continue;
+    }
+    const char* cells[SOBJ_COLS];
+    sobject_row(o, cells);
+    for(int i = 0 ; i < SOBJ_COLS ; ++i){
+      const int w = (int)strlen(cells[i]);
+      if(w > widths[i]){
+        widths[i] = w;
+      }
+    }
+    ++matched;
+  }
+
+  if(matched == 0){
+    fprintf(stderr, SFCC_PROGNAME ": no objects matched"
+                    " (%d in this org)\n", total);
+    cJSON_Delete(root);
+    return 1;
+  }
+
+  if(!opt->no_header){
+    print_row(SOBJ_HEADERS, widths);
+  }
+
+  int printed = 0;
+  cJSON_ArrayForEach(o, arr){
+    if(!sobject_wanted(o, opt)){
+      continue;
+    }
+    if(opt->limit > 0 && printed >= opt->limit){
+      continue;
+    }
+    const char* cells[SOBJ_COLS];
+    sobject_row(o, cells);
+    print_row(cells, widths);
+    ++printed;
+  }
+
+  if(!g_quiet){
+    printf("%d of %d object%s\n", printed, total, total == 1 ? "" : "s");
+  }
+
+  cJSON_Delete(root);
+  return 0;
+}
+
 static int cmd_versions(sfcc_client* c){
   char* body = NULL;
   sfcc_status rc = sfcc_list_versions(c, &body);
@@ -535,6 +770,10 @@ int main(int argc, char** argv){
   const char* zip_path = NULL;
   sfcc_deploy_options dopts;
   sfcc_deploy_options_defaults(&dopts);
+
+  /* sobjects options */
+  sobjects_opts sopts = { .custom_only = 0, .no_header = 0,
+                          .limit = 0, .filter = NULL };
 
   /* rest options */
   const char* rest_method = NULL;
@@ -635,6 +874,20 @@ int main(int argc, char** argv){
       insecure = 1;
     }else if(strcmp(name, "--zip") == 0){
       NEEDS_VALUE(zip_path);
+    }else if(strcmp(name, "--custom") == 0){
+      sopts.custom_only = 1;
+    }else if(strcmp(name, "--no-header") == 0){
+      sopts.no_header = 1;
+    }else if(strcmp(name, "--filter") == 0){
+      NEEDS_VALUE(sopts.filter);
+    }else if(strcmp(name, "--limit") == 0){
+      const char* v = NULL;
+      NEEDS_VALUE(v);
+      sopts.limit = strtol(v, NULL, 10);
+      if(sopts.limit <= 0){
+        fprintf(stderr, SFCC_PROGNAME ": --limit must be a positive number\n");
+        return 2;
+      }
     }else if(strcmp(name, "--validate-only") == 0){
       dopts.validate_only = 1;
     }else if(strcmp(name, "--single-package") == 0){
@@ -816,6 +1069,14 @@ int main(int argc, char** argv){
     }
   }else if(strcmp(cmd, "versions") == 0){
     rc = cmd_versions(c);
+  }else if(strcmp(cmd, "sobjects") == 0){
+    if(nargs != 0){
+      fprintf(stderr, SFCC_PROGNAME ": sobjects takes no arguments"
+                  " (to list one object's fields, use: describe <object>)\n");
+      rc = 2;
+    }else{
+      rc = cmd_sobjects(c, &sopts);
+    }
   }else if(strcmp(cmd, "whoami") == 0){
     rc = cmd_whoami(c);
   }else if(strcmp(cmd, "query") == 0){
