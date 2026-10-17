@@ -436,24 +436,28 @@ cmake --preset debug && cmake --build --preset debug
 ctest --test-dir build/debug --output-on-failure
 ```
 
-11 tests, none of which need a Salesforce org or any credential:
+29 tests, none of which need a Salesforce org or any credential:
 
-- 83 unit checks covering percent-encoding, the growable buffer, input
-  validation, and both server error shapes — the parts that fail *silently*
-  when wrong, as a bad encoder still returns HTTP 200 and the wrong records
-- CLI tests for argument handling and exit codes
+- 104 unit checks covering percent-encoding, the growable buffer, input
+  validation, both server error shapes, and the binary-body length — the parts
+  that fail *silently* when wrong, as a bad encoder still returns HTTP 200 and
+  the wrong records
+- 28 CLI tests for argument handling and exit codes
+- an end-to-end suite that drives the real binary against a mock endpoint and
+  inspects the bytes on the wire (`tests/e2e/` — its README explains why that
+  layer is not redundant with the unit tests)
 
-There is also an end-to-end check against a mock endpoint that asserts the
-actual wire format — that the token request is form-encoded, that SOQL arrives
-correctly encoded, that the bearer header and version are where they should
-be.
-
-The suite also builds clean under AddressSanitizer and UBSan:
+The ASan preset adds AddressSanitizer and UBSan:
 
 ```sh
 cmake --preset asan && cmake --build --preset asan
 ctest --preset asan
 ```
+
+Continuous integration runs on every push and pull request: Linux with both gcc
+and clang at `-Werror` across all three presets, the end-to-end suite against a
+*release* binary, macOS against Homebrew's libcurl, and Windows via MSVC and
+vcpkg. No secrets are configured, because no test needs any.
 
 ## Limitations
 

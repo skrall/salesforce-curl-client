@@ -1,0 +1,493 @@
+#!/usr/bin/env python3
+"""
+End-to-end tests for the sfcc CLI.
+
+Covers what the ctest suite cannot: the actual bytes on the wire. The unit
+tests assert on encoding functions and return values; this drives the real
+binary against a mock Salesforce endpoint and inspects what came back. That is
+the only reason the missing "Authorization: " prefix was ever caught -- a unit
+test on the string constant would have passed while every request went out
+unauthenticated.
+
+Python rather than shell on purpose: bash is not on Windows by default, and this
+project targets three platforms. Runs anywhere Python does, needs nothing
+installed (stdlib only), and needs no Salesforce org or credentials.
+
+    python3 tests/e2e/e2e.py build/release/bin/sfcc
+    python3 tests/e2e/e2e.py --verbose build/debug/bin/sfcc
+
+Exit status is 0 when everything passed and 1 otherwise.
+"""
+
+import os
+import shutil
+import stat
+import subprocess
+import sys
+import tempfile
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from mock_server import (BLOB, MOCK_CLIENT_ID, MOCK_SECRET, MockSalesforce,
+                         STATE)
+
+IS_WINDOWS = os.name == "nt"
+
+
+class Results:
+    def __init__(self):
+        self.passed = 0
+        self.failed = 0
+        self.group = ""
+        self.failures = []
+
+    def section(self, name):
+        self.group = name
+        print("\n== %s" % name)
+
+    def ok(self, what):
+        self.passed += 1
+        print("  ok   %s" % what)
+
+    def bad(self, what, detail=""):
+        self.failed += 1
+        self.failures.append((self.group, what, detail))
+        print("  FAIL %s" % what)
+        if detail:
+            for line in str(detail).splitlines():
+                print("         %s" % line[:200])
+
+    def check(self, cond, what, detail=""):
+        (self.ok if cond else self.bad)(what) if cond else self.bad(what, detail)
+
+    def contains(self, haystack, needle, what):
+        if needle in haystack:
+            self.ok(what)
+        else:
+            self.bad(what, "expected to contain: %r\nin: %r"
+                     % (needle, haystack[:400]))
+
+    def lacks(self, haystack, needle, what):
+        if needle not in haystack:
+            self.ok(what)
+        else:
+            self.bad(what, "should NOT contain: %r\nin: %r"
+                     % (needle, haystack[:400]))
+
+
+class Client:
+    """Thin wrapper around the sfcc binary under test."""
+
+    def __init__(self, path, login_url, workdir):
+        self.path = path
+        self.login_url = login_url
+        self.workdir = workdir
+        self.env = dict(os.environ)
+        # Cleared so a developer's own exported variables cannot change the
+        # outcome of a run, and the mock's fake credentials are used instead.
+        for var in ("SFCC_CLIENT_ID", "SFCC_CLIENT_SECRET",
+                    "SFCC_ACCESS_TOKEN", "SFCC_INSTANCE_URL",
+                    "SFCC_TOKEN_CACHE"):
+            self.env.pop(var, None)
+        self.env["SFCC_CLIENT_ID"] = MOCK_CLIENT_ID
+        self.env["SFCC_CLIENT_SECRET"] = MOCK_SECRET
+
+    def run(self, *args, stdin=None, no_cache=True):
+        """Run sfcc against the mock. Returns (returncode, stdout, stderr).
+
+        no_cache is on by default so no test is at the mercy of a token cache
+        left behind by an earlier one. The cache tests turn it off.
+        """
+        cmd = [self.path, "--login-url", self.login_url]
+        if no_cache:
+            cmd.append("--no-cache")
+        cmd += list(args)
+        proc = subprocess.run(cmd, capture_output=True, text=True,
+                              input=stdin, env=self.env, cwd=self.workdir,
+                              timeout=120)
+        return proc.returncode, proc.stdout, proc.stderr
+
+    def path_in(self, name):
+        return os.path.join(self.workdir, name)
+
+
+def make_package(workdir):
+    """Build a real metadata zip, the way a user's would be made.
+
+    Uses Python's zipfile rather than shelling out to `zip`, so this works on a
+    machine without it -- and so the test does not depend on the platform's
+    archiver producing a byte-identical archive.
+    """
+    import zipfile
+    pkg = os.path.join(workdir, "pkg", "classes")
+    os.makedirs(pkg, exist_ok=True)
+    with open(os.path.join(workdir, "pkg", "package.xml"), "w") as fh:
+        fh.write(
+            '<?xml version="1.0" encoding="UTF-8"?>\n'
+            '<Package xmlns="http://soap.sforce.com/2006/04/metadata">\n'
+            '  <types><members>Good</members><members>Bad</members>'
+            '<name>ApexClass</name></types>\n'
+            '  <version>64.0</version>\n</Package>\n')
+    with open(os.path.join(pkg, "Good.cls"), "w") as fh:
+        fh.write("public class Good {}\n")
+    with open(os.path.join(pkg, "Bad.cls"), "w") as fh:
+        fh.write("public class Bad { oops }\n")
+
+    zpath = os.path.join(workdir, "deploy.zip")
+    with zipfile.ZipFile(zpath, "w", zipfile.ZIP_DEFLATED) as zf:
+        zf.write(os.path.join(workdir, "pkg", "package.xml"), "package.xml")
+        zf.write(os.path.join(pkg, "Good.cls"), "classes/Good.cls")
+        zf.write(os.path.join(pkg, "Bad.cls"), "classes/Bad.cls")
+    return zpath
+
+
+# --------------------------------------------------------------------------
+# The tests
+# --------------------------------------------------------------------------
+
+def test_auth(c, r):
+    r.section("auth: form-encoded token request")
+    rc, out, err = c.run("auth")
+    if rc == 0:
+        r.ok("auth exits 0")
+    else:
+        r.bad("auth exits 0", "rc=%d out=%s err=%s" % (rc, out, err))
+    r.contains(out, c.login_url, "instance url reported")
+    # The secret must never be echoed, not even into an error path.
+    r.lacks(out + err, MOCK_SECRET, "secret never printed")
+
+    r.section("auth: bad client id surfaces the OAuth error shape")
+    rc, out, err = c.run("auth")
+    bad_env = dict(c.env)
+    bad_env["SFCC_CLIENT_ID"] = "wrong-key"
+    proc = subprocess.run(
+        [c.path, "--login-url", c.login_url, "--no-cache", "auth"],
+        capture_output=True, text=True, env=bad_env, timeout=60)
+    blob = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        r.ok("bad creds exits nonzero")
+    else:
+        r.bad("bad creds exits nonzero", blob)
+    r.contains(blob, "invalid_client", "reports invalid_client")
+    r.contains(blob, "client identifier invalid", "reports the description")
+    r.lacks(blob, '{"error"', "not printed as a raw json blob")
+
+
+def test_query(c, r):
+    r.section("query: SOQL arrives percent-encoded and decodes identically")
+    soql = ("SELECT Id, Name FROM Account WHERE Name = 'O''Brien & Co' "
+            "LIMIT 2")
+    rc, out, err = c.run("query", soql)
+    if rc == 0:
+        r.ok("query exits 0")
+    else:
+        r.bad("query exits 0", "rc=%d err=%s" % (rc, err))
+    r.contains(out, "001000000000000AAA", "first record returned")
+    r.contains(out, "O'Brien", "apostrophe record returned")
+    r.contains(out, '"records"', "records array returned")
+
+    r.section("query: the server error shape is unpacked, not dumped")
+    rc, out, err = c.run("query", "SELECT Bogus FROM Account FAIL_ME")
+    blob = out + err
+    if rc != 0:
+        r.ok("bad query exits nonzero")
+    else:
+        r.bad("bad query exits nonzero", blob)
+    r.contains(blob, "INVALID_FIELD", "errorCode extracted")
+    r.contains(blob, "No such column", "message extracted")
+    r.lacks(blob, '[{"message"', "not printed as a raw json blob")
+
+
+def test_records(c, r):
+    r.section("get / create / update / delete")
+    rc, out, err = c.run("get", "Account", "001000000000000AAA")
+    if rc == 0:
+        r.ok("get exits 0")
+    else:
+        r.bad("get exits 0", "rc=%d err=%s" % (rc, err))
+    r.contains(out, "Acme Corporation", "record returned")
+
+    rc, out, err = c.run("create", "Account", '{"Name":"New Co"}')
+    if rc == 0:
+        r.ok("create exits 0")
+    else:
+        r.bad("create exits 0", "rc=%d err=%s" % (rc, err))
+    r.contains(out, "001000000000000CCC", "new id returned")
+
+    rc, out, err = c.run("update", "Account", "001000000000000AAA",
+                         '{"Phone":"555-0100"}')
+    if rc == 0:
+        r.ok("update exits 0 (204 with no body)")
+    else:
+        r.bad("update exits 0 (204 with no body)", "rc=%d err=%s" % (rc, err))
+
+    rc, out, err = c.run("delete", "Account", "001000000000000AAA")
+    if rc == 0:
+        r.ok("delete exits 0 (204 with no body)")
+    else:
+        r.bad("delete exits 0 (204 with no body)", "rc=%d err=%s" % (rc, err))
+
+
+def test_validation(c, r):
+    """Bad arguments must be caught locally, costing no request."""
+    r.section("local validation: no request is made")
+    cases = [
+        (("get", "Account", "not-an-id"), "15 or 18",
+         "bad record id explained"),
+        (("get", "../User", "001000000000000AAA"), "invalid sObject",
+         "path traversal in an object name rejected"),
+        (("create", "Account", '{"Name": broken}'), "not valid JSON",
+         "malformed json body rejected"),
+    ]
+    for args, needle, what in cases:
+        rc, out, err = c.run(*args)
+        if rc != 0:
+            r.ok(what + " (exits nonzero)")
+        else:
+            r.bad(what + " (exits nonzero)", out + err)
+        r.contains(out + err, needle, what)
+
+    rc, out, err = c.run("get", "Account", "001000000000000AAA")
+    r.check(rc == 0, "a well-formed call still succeeds afterwards", out + err)
+
+
+def test_rest(c, r):
+    r.section("rest: relative path gets the versioned prefix")
+    rc, out, err = c.run("rest", "limits")
+    if rc == 0:
+        r.ok("rest exits 0")
+    else:
+        r.bad("rest exits 0", "rc=%d err=%s" % (rc, err))
+    r.contains(out, "DailyApiRequests", "body returned")
+
+    r.section("rest: {version} is substituted in an absolute path")
+    rc, out, err = c.run("rest", "/services/data/{version}/limits")
+    r.contains(out, "DailyApiRequests", "versioned absolute path works")
+
+    r.section("rest: -i shows the response head")
+    rc, out, err = c.run("rest", "limits", "-i")
+    r.contains(out, "HTTP/1.1 200", "status line shown")
+    r.contains(out, "Sforce-Limit-Info", "custom response header shown")
+
+    r.section("rest: custom headers and body are delivered")
+    rc, out, err = c.run("rest", "echo", "-X", "POST",
+                         "-H", "X-Custom-Thing: hello", "-d", '{"Name":"Acme"}')
+    r.contains(out, "hello", "custom header arrived")
+    r.contains(out, "Acme", "body arrived")
+    r.contains(out, "00Dxx0000000001", "our own auth was sent")
+
+    r.section("rest: a caller-supplied Authorization replaces ours")
+    rc, out, err = c.run("rest", "echo", "-H", "Authorization: Bearer mine")
+    r.contains(out, "Bearer mine", "replacement token used")
+    r.lacks(out, "00Dxx0000000001", "our token was not sent alongside")
+
+    r.section("rest: a 4xx prints the body on stdout and exits 1")
+    rc, out, err = c.run("rest", "echo", "-H", "Authorization: Bearer wrong-token")
+    if rc == 1:
+        r.ok("4xx exits 1")
+    else:
+        r.bad("4xx exits 1", "rc=%d out=%s" % (rc, out))
+    r.contains(out, "INSUFFICIENT_ACCESS", "error body on stdout, parseable")
+    r.contains(err, "HTTP 403", "status noted on stderr")
+
+    r.section("rest: a rejected token is not reported as missing credentials")
+    # The bug this guards: a stale token used to be discarded and replaced with
+    # a vague "no credentials", hiding the 401 that actually explained it.
+    rc, out, err = c.run("rest", "/id/x/y")
+    r.lacks(out + err, "no credentials",
+            "rejected token is not misreported as no credentials")
+
+
+def test_binary_output(c, r):
+    r.section("rest: a binary body is not truncated at the first NUL")
+    dest = c.path_in("blob.bin")
+    rc, out, err = c.run("rest",
+                         "sobjects/ContentVersion/068xx000000000AAA/VersionData",
+                         "-o", dest)
+    if os.path.exists(dest):
+        with open(dest, "rb") as fh:
+            got = fh.read()
+        if got == BLOB:
+            r.ok("body written byte-exact (%d bytes, NULs intact)" % len(got))
+        else:
+            r.bad("body written byte-exact",
+                  "expected %r got %r" % (BLOB, got))
+    else:
+        r.bad("output file was written", "rc=%d err=%s" % (rc, err))
+
+    # And to stdout, where a C-string write would also truncate.
+    rc, out_bytes, err = subprocess_run_bytes(
+        c, ["rest", "sobjects/ContentVersion/068xx000000000AAA/VersionData"])
+    if out_bytes == BLOB:
+        r.ok("body to stdout byte-exact")
+    else:
+        r.bad("body to stdout byte-exact", "got %r" % out_bytes[:64])
+
+
+def subprocess_run_bytes(c, args):
+    cmd = [c.path, "--login-url", c.login_url, "--no-cache"] + args
+    proc = subprocess.run(cmd, capture_output=True, env=c.env,
+                          cwd=c.workdir, timeout=120)
+    return proc.returncode, proc.stdout, proc.stderr
+
+
+def test_stdio(c, r):
+    r.section("stdin and stdout composability")
+    rc, out, err = c.run("rest", "echo", "-X", "POST", "-d", "@-",
+                         stdin='{"Name":"From Pipe"}')
+    r.contains(out, "From Pipe", "-d @- reads stdin")
+
+    rc, out, err = c.run("rest", "echo", "-X", "POST", "--data-file", "-",
+                         stdin='{"Name":"ViaDataFile"}')
+    r.contains(out, "ViaDataFile", "--data-file - reads stdin")
+
+    body_file = c.path_in("body.json")
+    with open(body_file, "w") as fh:
+        fh.write('{"Name":"AtFile"}')
+    rc, out, err = c.run("rest", "echo", "-X", "POST", "-d", "@" + body_file)
+    r.contains(out, "AtFile", "-d @path reads a file")
+
+    rc, out, err = c.run("rest", "echo", "-X", "POST", "-d", "@-", stdin="")
+    if rc != 0:
+        r.ok("empty stdin is refused")
+    else:
+        r.bad("empty stdin is refused", "rc=%d out=%s" % (rc, out))
+    r.contains(out + err, "standard input was empty", "empty stdin explained")
+
+    r.section("stdout is the default sink")
+    rc, out, err = c.run("rest", "limits", "--raw")
+    r.contains(out, '"Max":100000', "stdout usable in a pipeline")
+
+    dest = c.path_in("lim.json")
+    rc, out, err = c.run("rest", "limits", "-o", dest)
+    with open(dest) as fh:
+        r.contains(fh.read(), "DailyApiRequests", "-o file writes the body")
+    r.check(out == "", "stdout is empty when -o names a file",
+            "got %d bytes on stdout" % len(out))
+
+
+def test_deploy(c, r):
+    zip_path = make_package(c.workdir)
+    r.section("deploy: multipart upload, async poll, failure report")
+    rc, out, err = c.run("deploy", "--zip", zip_path,
+                         "--test-level", "local", "--poll-interval", "1")
+    blob = out + err
+    # The org reported failures, so a deploy that "worked" must not exit 0.
+    if rc == 1:
+        r.ok("failed deploy exits 1 (not 0, not a crash)")
+    else:
+        r.bad("failed deploy exits 1", "rc=%d out=%s" % (rc, blob))
+    r.contains(out, "Deploy failed", "reports the failure")
+    r.contains(out, "Bad", "names the failing component")
+    r.contains(out, "classes/Bad.cls", "shows the failing file")
+    r.contains(out, "Good", "lists the successful component")
+    r.contains(out, "tests: 2 passed", "test counts parsed")
+    r.lacks(out, '"componentFailures"', "not printed as a raw json blob")
+
+    r.section("deploy: options reach the wire correctly")
+    cache = c.path_in("unused")
+    rc, out, err = c.run("deploy", "--zip", zip_path, "--validate-only",
+                         "--test-level", "specified", "--tests", "MyTest",
+                         "--single-package", "--poll-interval", "1")
+    opts = STATE.deploys.get("0Af1B000000DeployAAA", {}).get("options", "")
+    for needle, what in [
+        ('"deployOptions":"validateOnly"', "validateOnly sent"),
+        ('"testLevel":"RunSpecifiedTests"', "RunSpecifiedTests sent"),
+        ('"tests":"MyTest"', "tests list sent"),
+        ('"singlePackage":true', "singlePackage sent"),
+    ]:
+        r.contains(opts, needle, what)
+    del cache
+
+    r.section("deploy: a non-zip never reaches the network")
+    junk = c.path_in("junk.bin")
+    with open(junk, "w") as fh:
+        fh.write("not a zip\n")
+    rc, out, err = c.run("deploy", "--zip", junk)
+    blob = out + err
+    if rc != 0:
+        r.ok("non-zip exits nonzero")
+    else:
+        r.bad("non-zip exits nonzero", blob)
+    r.contains(blob, "zip signature", "explains the signature problem")
+
+    r.section("deploy: the token cache is not world readable")
+    if IS_WINDOWS:
+        r.ok("skipped on Windows: POSIX mode bits are not consulted there")
+    else:
+        cache = c.path_in("token.json")
+        # no_cache must be off, or there is nothing to write.
+        rc, out, err = c.run("--token-cache", cache, "auth", no_cache=False)
+        if os.path.exists(cache):
+            mode = stat.S_IMODE(os.stat(cache).st_mode)
+            if mode == 0o600:
+                r.ok("cache is mode 0600 (got %o)" % mode)
+            else:
+                r.bad("cache is mode 0600", "got %o" % mode)
+        else:
+            r.bad("cache file written", "no file at %s" % cache)
+
+
+def test_transport_errors(c, r):
+    r.section("transport failures are named")
+    env = dict(c.env)
+    proc = subprocess.run(
+        [c.path, "--login-url", "https://no-such-host.invalid", "--no-cache",
+         "auth"],
+        capture_output=True, text=True, env=env, timeout=90)
+    blob = proc.stdout + proc.stderr
+    if proc.returncode != 0:
+        r.ok("dns failure exits nonzero")
+    else:
+        r.bad("dns failure exits nonzero", blob)
+    r.contains(blob, "could not reach", "names the transport problem")
+
+    rc, out, err = c.run("--insecure-skip-verify", "auth")
+    r.contains(out + err, "verification is disabled",
+            "--insecure-skip-verify warns loudly")
+
+
+# --------------------------------------------------------------------------
+
+ALL = [test_auth, test_query, test_records, test_validation, test_rest,
+       test_binary_output, test_stdio, test_deploy, test_transport_errors]
+
+
+def main(argv):
+    verbose = "--verbose" in argv
+    args = [a for a in argv if not a.startswith("--")]
+    if not args:
+        print(__doc__.strip())
+        return 2
+    binary = os.path.abspath(args[0])
+    if not (os.path.isfile(binary) and os.access(binary, os.X_OK)):
+        print("not an executable: %s" % binary, file=sys.stderr)
+        return 2
+
+    workdir = tempfile.mkdtemp(prefix="sfcc-e2e-")
+    r = Results()
+    try:
+        with MockSalesforce() as base_url:
+            print("mock Salesforce: %s" % base_url)
+            c = Client(binary, base_url, workdir)
+            for fn in ALL:
+                try:
+                    fn(c, r)
+                except Exception as exc:      # a crash in one group is a failure
+                    import traceback
+                    r.bad("%s raised" % fn.__name__, traceback.format_exc())
+                    del exc
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+    print("\n" + "-" * 44)
+    if r.failed:
+        print("%d passed, %d FAILED" % (r.passed, r.failed))
+        for grp, what, detail in r.failures:
+            print("  [%s] %s" % (grp, what))
+        return 1
+    print("%d passed, 0 failed" % r.passed)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

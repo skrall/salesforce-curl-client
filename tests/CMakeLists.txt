@@ -188,3 +188,26 @@ set_tests_properties(cli_rest_many_headers_no_crash PROPERTIES
 # A query with no statement.
 add_test(NAME cli_query_needs_soql COMMAND sfcc_cli query)
 set_tests_properties(cli_query_needs_soql PROPERTIES WILL_FAIL TRUE)
+
+# --- end-to-end -------------------------------------------------------------
+#
+# The tests above cover units and CLI argument handling with no server. This one
+# drives the real binary against a mock Salesforce endpoint and checks the bytes
+# on the wire -- which is the only reason the missing "Authorization: " prefix
+# was ever caught. A unit test on the string constant would have passed while
+# every request went out unauthenticated.
+#
+# Registered only where Python is present, so a machine without it still gets
+# the rest of the suite. Skipped on Windows: these assert on POSIX file modes and
+# lean on a background server's timing, and they are worth far more running
+# properly on one platform than half-broken on three.
+
+find_package(Python3 COMPONENTS Interpreter QUIET)
+if(Python3_Interpreter_FOUND AND NOT WIN32)
+  # Always run against the binary as built, which may be optimised. A
+  # release-only crash was hiding in exactly this path.
+  add_test(NAME e2e
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/e2e/e2e.py"
+            "$<TARGET_FILE:sfcc_cli>")
+  set_tests_properties(e2e PROPERTIES TIMEOUT 300)
+endif()

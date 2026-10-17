@@ -1,0 +1,213 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  # Run on pushes to the default branch and on every PR, open or closed.
+  workflow_dispatch:
+
+# A new push to a PR makes the previous run irrelevant. Cancelling keeps the
+# queue from filling with superseded builds.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  # Silence a wall of CMake chatter so a failure is visible in the log.
+  CTEST_OUTPUT_ON_FAILURE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------
+  # Linux: both compilers, all three presets, plus the install check.
+  #
+  # gcc and clang separately is the point. They disagree about warnings, and
+  # -Werror across both is what keeps the code portable rather than merely
+  # correct on the machine it was written on.
+  # ---------------------------------------------------------------------
+  linux:
+    name: linux (${{ matrix.cc }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false        # one compiler failing should not hide the other
+      matrix:
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev
+
+      - name: Configure
+        run: |
+          cmake -S . -B build/debug \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DSFCC_WERROR=ON
+
+      - name: Build (debug)
+        run: cmake --build build/debug --parallel
+
+      - name: Test (debug)
+        run: ctest --test-dir build/debug --output-on-failure
+
+      # Release separately: an optimised build is where a latent memory bug
+      # becomes an actual crash, and it is the binary that ships.
+      - name: Build and test (release)
+        run: |
+          cmake -S . -B build/release \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSFCC_WERROR=ON
+          cmake --build build/release --parallel
+          ctest --test-dir build/release --output-on-failure
+
+      - name: Build and test (ASan + UBSan)
+        run: |
+          cmake -S . -B build/asan \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DSFCC_WERROR=ON \
+            -DCMAKE_C_FLAGS="-fsanitize=address,undefined -fno-omit-frame-pointer -g" \
+            -DCMAKE_EXE_LINKER_FLAGS="-fsanitize=address,undefined"
+          cmake --build build/asan --parallel
+          ASAN_OPTIONS=detect_leaks=1 \
+          UBSAN_OPTIONS=print_stacktrace=1 \
+            ctest --test-dir build/asan --output-on-failure
+
+      - name: Install
+        run: |
+          sudo cmake --install build/release
+          sfcc --version
+
+      - name: Build the container image
+        run: |
+          docker build -t sfcc:ci .
+          docker run --rm sfcc:ci --version
+
+  # ---------------------------------------------------------------------
+  # End-to-end against the mock endpoint.
+  #
+  # Kept separate from the matrix so a wire-format failure is visibly not a
+  # compiler problem. Runs the release binary, because that is the one where
+  # the crash was hiding.
+  # ---------------------------------------------------------------------
+  e2e:
+    name: end-to-end
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build libcurl4-openssl-dev
+
+      - name: Build (release)
+        run: |
+          cmake -S . -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release -DSFCC_WERROR=ON
+          cmake --build build --parallel
+
+      - name: End-to-end against the mock endpoint
+        run: python3 tests/e2e/e2e.py build/bin/sfcc
+
+  # ---------------------------------------------------------------------
+  # macOS. libcurl's headers are usually absent here, so curl comes from
+  # Homebrew and CMake has to be pointed at it. ASan is not run: it is not
+  # reliable on this platform and Linux already covers it.
+  # ---------------------------------------------------------------------
+  macos:
+    name: macos
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install libcurl
+        run: brew install curl
+
+      - name: Configure
+        run: |
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DSFCC_WERROR=ON \
+            -DCMAKE_PREFIX_PATH="$(brew --prefix curl)"
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Test
+        # The e2e test is registered only on non-Windows, but the unit tests
+        # assert POSIX file modes, which macOS has, so everything runs here.
+        run: ctest --test-dir build --output-on-failure
+
+  # ---------------------------------------------------------------------
+  # Windows via MSVC and vcpkg. Nothing is bundled, so vcpkg supplies libcurl;
+  # the cache keeps this from costing minutes on every push.
+  # ---------------------------------------------------------------------
+  windows:
+    name: windows (msvc)
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up vcpkg
+        uses: lukka/get-cmake@latest
+        with:
+          cmakeVersion: '>=3.21'
+
+      - name: Install libcurl
+        run: vcpkg install curl:x64-windows-static-md
+
+      - name: Configure
+        run: >
+          cmake -S . -B build
+          -A x64
+          -DCMAKE_TOOLCHAIN_FILE=${{ env.VCPKG_ROOT }}/scripts/buildsystems/vcpkg.cmake
+          -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+
+  # ---------------------------------------------------------------------
+  # A lint that needs no toolchain: the source must be free of tabs, trailing
+  # whitespace and CRLF. Cheap, and it keeps diffs readable.
+  # ---------------------------------------------------------------------
+  hygiene:
+    name: source hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: No tabs or trailing whitespace in our C sources
+        # third_party is excluded deliberately: that is cJSON's code, not ours,
+        # and it has trailing whitespace we should not be reformatting. This
+        # lint caught exactly that on its first run, which is the point of
+        # running it locally before pushing.
+        run: |
+          fail=0
+          for f in $(git ls-files '*.c' '*.h' ':!:third_party/*'); do
+            if grep -nP '\t' "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::tab character"; fail=1
+            fi
+            if grep -nP ' +$' "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::trailing whitespace"; fail=1
+            fi
+            if grep -nP '\r$' "$f" >/dev/null 2>&1; then
+              echo "::error file=$f::CRLF line ending"; fail=1
+            fi
+          done
+          if [ "$fail" -eq 0 ]; then echo "source hygiene clean"; fi
+          exit $fail
