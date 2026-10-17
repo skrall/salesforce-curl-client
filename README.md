@@ -116,7 +116,7 @@ Sandboxes use `--login-url https://test.salesforce.com`.
 | `create <object> <json>` | Insert a record |
 | `update <object> <id> <json>` | Update a record |
 | `delete <object> <id>` | Delete a record |
-| `describe <object>` | Object metadata: fields, types, picklists |
+| `describe <object>` | Object metadata as three tables: fields, children, record types |
 | `sobjects` | Every object in the org, as a table |
 | `versions` | API versions this org supports |
 | `rest <path>` | One raw REST call, with auth applied |
@@ -177,8 +177,55 @@ flag Salesforce omits renders as `no` rather than as a blank, because a
 capability table with holes in it is harder to read than one that is
 pessimistic.
 
-`describe <object>` is the other half of this: it takes one object and returns
-its fields, types and picklist values.
+### Describing one object
+
+`describe <object>` prints three tables — fields, child relationships and
+record types — rather than one wall of JSON:
+
+```console
+$ sfcc describe Account --field Revenue
+
+fields (1)
+NAME           LABEL           TYPE      LEN  SIZE  REL NAME  REFERENCE TO
+AnnualRevenue  Annual Revenue  currency  18   18,0  -         -
+
+child relationships (3)
+FIELD      CHILD OBJECT  REL NAME
+AccountId  Contact       Contacts
+AccountId  Opportunity   Opportunities
+AccountId  AccountShare  -
+
+record types (3)
+ID                  NAME      DEVELOPER NAME  ACTIVE  MASTER  AVAILABLE  DEFAULT
+012000000000000AAA  Master    Master          yes     yes     yes        yes
+012000000000000BBB  Customer  Customer        yes     no      yes        no
+012000000000000CCC  Partner   Partner         no      no      no         no
+```
+
+| Option | Description |
+| --- | --- |
+| `--json` | The whole response as indented JSON |
+| `--field <text>` | Only fields whose name or label contains `<text>` |
+| `--no-header` | Omit the column header line of each table |
+
+`--field` is the practical one: a wide object like Account has around ninety
+fields, and scanning for the one you care about is the reason to reach for
+`describe` in the first place. `--filter` narrows only the fields table; the
+other two always print in full, since they are short.
+
+A few things the tables make explicit that the raw JSON leaves to be inferred:
+
+- **`SIZE` is `precision,scale`**, and is `-` for the many types that have
+  neither. `LEN` is `-` for those too — a `datetime` or a `boolean` reports a
+  length of zero, and printing that `0` invites the reader to believe it.
+- **`REFERENCE TO` lists several entries for a polymorphic reference.** `OwnerId`
+  can be a `User` or a `Group`, and both are shown, comma separated.
+- **`REL NAME` and `REFERENCE TO` are different columns.** A lookup provides
+  both a relationship name and a target object; only one of the two is present
+  for most fields, and the other shows `-`.
+
+Note that `--json` exists because `describe` used to print indented JSON by
+default. Piping it into `jq` still works, without `--raw`.
 
 ### The `rest` escape hatch
 

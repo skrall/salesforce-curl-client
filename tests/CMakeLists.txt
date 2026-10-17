@@ -208,6 +208,19 @@ add_test(NAME cli_filter_needs_a_value COMMAND sfcc_cli sobjects --filter)
 set_tests_properties(cli_filter_needs_a_value PROPERTIES
   PASS_REGULAR_EXPRESSION "needs a value")
 
+# describe, likewise. The instance and token are supplied so the run gets past
+# the credential gate -- which is checked before the argument count, so without
+# them the failure would be "no credentials" and the assertion below vacuous.
+# 127.0.0.1:1 is never reached: the argument check comes first.
+add_test(NAME cli_describe_needs_an_object
+  COMMAND sfcc_cli describe --instance http://127.0.0.1:1 --token dummy)
+set_tests_properties(cli_describe_needs_an_object PROPERTIES
+  PASS_REGULAR_EXPRESSION "needs an object name")
+
+add_test(NAME cli_describe_field_needs_a_value COMMAND sfcc_cli describe Account --field)
+set_tests_properties(cli_describe_field_needs_a_value PROPERTIES
+  PASS_REGULAR_EXPRESSION "needs a value")
+
 # --- end-to-end -------------------------------------------------------------
 #
 # The tests above cover units and CLI argument handling with no server. This one

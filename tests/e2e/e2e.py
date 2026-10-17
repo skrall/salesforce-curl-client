@@ -20,6 +20,7 @@ Exit status is 0 when everything passed and 1 otherwise.
 """
 
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -195,6 +196,184 @@ def test_query(c, r):
     r.contains(blob, "INVALID_FIELD", "errorCode extracted")
     r.contains(blob, "No such column", "message extracted")
     r.lacks(blob, '[{"message"', "not printed as a raw json blob")
+
+
+def _tables(out):
+    """Split describe output into {section: [lines]} keyed by table.
+
+    Indexing the output by line number is fragile -- the first heading is
+    preceded by a blank line, and --no-header removes a line entirely -- so the
+    headings are used as the anchors instead.
+    """
+    names = {"fields (": "fields",
+             "child relationships (": "children",
+             "record types (": "recordtypes"}
+    out_tables = {}
+    cur = None
+    for ln in out.splitlines():
+        matched = None
+        for prefix, key in names.items():
+            if ln.startswith(prefix):
+                matched = key
+                break
+        if matched is not None:
+            cur = matched
+            out_tables[cur] = []
+        elif cur is not None and ln.strip():
+            out_tables[cur].append(ln)
+    return out_tables
+
+
+def _rows(section_lines):
+    """Drop a header line if the first row looks like one."""
+    if section_lines and section_lines[0].split()[:1] == ["NAME"]:
+        return section_lines[1:]
+    if section_lines and section_lines[0].split()[:1] == ["FIELD"]:
+        return section_lines[1:]
+    if section_lines and section_lines[0].split()[:1] == ["ID"]:
+        return section_lines[1:]
+    return section_lines
+
+
+def test_describe(c, r):
+    """The three describe tables.
+
+    The fixture is built from the shapes Salesforce actually sends: an empty
+    referenceTo, a one-element one, a polymorphic two-element one, precision and
+    scale that are zero because they do not apply, a null relationshipName, and
+    a record type that is false in every flag column. Each is a way a renderer
+    can be quietly wrong without crashing.
+    """
+    r.section("describe: three tables, each with a heading and a count")
+    rc, out, err = c.run("describe", "Account")
+    if rc == 0:
+        r.ok("describe exits 0")
+    else:
+        r.bad("describe exits 0", "rc=%d err=%s" % (rc, err))
+
+    for title in ("fields (6)", "child relationships (3)", "record types (3)"):
+        r.contains(out, title, "section heading %r with its count" % title)
+
+    t = _tables(out)
+    r.check(len(t.get("fields", [])) == 7,
+            "the fields table has a header and six rows",
+            repr(t.get("fields")))
+    r.check(len(t.get("children", [])) == 4,
+            "the child table has a header and three rows",
+            repr(t.get("children")))
+    r.check(len(t.get("recordtypes", [])) == 4,
+            "the record types table has a header and three rows",
+            repr(t.get("recordtypes")))
+
+    r.section("describe: the fields table")
+    for col in ("NAME", "LABEL", "TYPE", "LEN", "SIZE", "REL NAME",
+                "REFERENCE TO"):
+        r.contains(t["fields"][0], col, "fields header %s" % col)
+
+    fields = _rows(t["fields"])
+    by_name = {ln.split()[0]: ln for ln in fields}
+    r.contains(out, "AnnualRevenue", "field API name listed")
+    r.contains(out, "Annual Revenue", "field label listed")
+    r.contains(out, "currency", "datatype listed")
+
+    # Matched with a regex rather than by splitting on whitespace and counting
+    # fields: labels contain spaces ("SLA Expiration Date"), so a positional
+    # index is only meaningful relative to the start of the row, not from zero.
+    # These patterns assert the whole cell run, which is the actual property
+    # being checked -- that each value landed in its own column.
+    r.section("describe: numeric columns distinguish zero from not-applicable")
+    def cellrun(row, tail):
+        return re.search(tail + r"\s*$", row) is not None
+
+    r.check(cellrun(by_name.get("AnnualRevenue", ""),
+                    r"currency\s+18\s+18,0\s+-\s+-\s*$"),
+            "a currency field shows precision,scale then dashes",
+            repr(by_name.get("AnnualRevenue")))
+    r.check(cellrun(by_name.get("SLAExpirationDate__c", ""),
+                    r"datetime\s+-\s+-\s+-\s+-"),
+            "a type with no length and no size shows -, not 0",
+            repr(by_name.get("SLAExpirationDate__c")))
+    r.check(cellrun(by_name.get("Name", ""),
+                    r"string\s+255\s+-\s+-\s+-"),
+            "a text field has a length but no size",
+            repr(by_name.get("Name")))
+
+    r.section("describe: referenceTo renders every shape")
+    r.check(cellrun(by_name.get("ParentId", ""),
+                    r"reference\s+18\s+-\s+Account\s+Account$"),
+            "a single reference: relationship name and reference are separate "
+            "columns", repr(by_name.get("ParentId")))
+    r.check(cellrun(by_name.get("OwnerId", ""),
+                    r"reference\s+18\s+-\s+-\s+User, Group$"),
+            "a polymorphic reference lists both, comma separated",
+            repr(by_name.get("OwnerId")))
+    r.check(cellrun(by_name.get("Id", ""), r"id\s+18\s+-\s+-\s+-$"),
+            "a non-relationship field shows - for both",
+            repr(by_name.get("Id")))
+
+    r.section("describe: child relationships")
+    r.contains(out, "Contacts", "relationship name listed")
+    r.contains(out, "AccountShare", "a child with no relationship name listed")
+    kids = _rows(t["children"])
+    r.check(any(ln.rstrip().endswith("-") for ln in kids),
+            "and its missing relationship name shows -", repr(kids))
+    r.check(any("Contact" in ln and "Opportunity" not in ln for ln in kids),
+            "each row names its own child object", repr(kids))
+
+    r.section("describe: record types")
+    r.contains(out, "DEVELOPER NAME", "developer name is a column")
+    rts = {ln.split()[0]: ln for ln in _rows(t["recordtypes"])}
+    master = rts.get("012000000000000AAA", "")
+    partner = rts.get("012000000000000CCC", "")
+    r.check(len(master.split()) == 7, "a record type row has seven fields",
+            repr(master))
+    r.check(master.split()[3:] == ["yes", "yes", "yes", "yes"],
+            "the master type is yes in all four flag columns", repr(master))
+    r.check(partner.split()[3:] == ["no", "no", "no", "no"],
+            "an inactive, unavailable type is no in all four", repr(partner))
+    r.check(rts.get("012000000000000BBB", "").split()[4] == "no",
+            "a non-master available type has master=no", repr(rts))
+
+    r.section("describe: --field narrows the fields table only")
+    rc, out, err = c.run("describe", "Account", "--field", "Revenue")
+    r.check(rc == 0, "--field exits 0", err)
+    r.contains(out, "fields (1)", "only one field row")
+    r.contains(out, "AnnualRevenue", "the matching field is there")
+    r.contains(out, "child relationships (3)", "the other tables are untouched")
+
+    rc, out, err = c.run("describe", "Account", "--field", "annual revenue")
+    r.contains(out, "AnnualRevenue", "matched case-insensitively on the label")
+
+    rc, out, err = c.run("describe", "Account", "--field", "zzzznomatch")
+    r.contains(out, "fields (0)", "a filter matching nothing gives an empty table")
+    r.contains(out, "record types (3)", "and leaves the other tables alone")
+
+    r.section("describe: --no-header drops every header line")
+    rc, out, err = c.run("describe", "Account", "--no-header")
+    r.check(rc == 0, "--no-header exits 0", err)
+    r.lacks(out, "REFERENCE TO", "the fields header is gone")
+    r.lacks(out, "DEVELOPER NAME", "the record types header is gone")
+    r.contains(out, "AnnualRevenue", "the rows are still there")
+    r.check(len(_rows(_tables(out)["fields"])) == 6,
+            "and all six of them", repr(_tables(out)["fields"]))
+
+    r.section("describe: --raw and --json both give the response")
+    rc, out, err = c.run("describe", "Account", "--raw")
+    r.check(rc == 0, "--raw exits 0", err)
+    r.check(out.count("\n") == 1, "--raw is a single line",
+            "%d newlines" % out.count("\n"))
+    r.contains(out, '"referenceTo"', "the raw response is verbatim")
+
+    rc, out, err = c.run("describe", "Account", "--json")
+    r.check(rc == 0, "--json exits 0", err)
+    r.check(out.count("\n") > 1, "--json is indented",
+            "%d newlines" % out.count("\n"))
+    r.lacks(out, "REFERENCE TO", "and is not the table")
+    r.contains(out, '"recordTypeInfos"', "with the arrays intact")
+
+    r.section("describe: an unknown object is still reported")
+    rc, out, err = c.run("describe", "NoSuchObject")
+    r.check(rc != 0, "an unknown object exits nonzero", "rc=%d" % rc)
 
 
 def test_sobjects(c, r):
@@ -559,7 +738,8 @@ def test_transport_errors(c, r):
 
 # --------------------------------------------------------------------------
 
-ALL = [test_auth, test_query, test_sobjects, test_records,
+ALL = [test_auth, test_query, test_sobjects, test_describe,
+       test_records,
        test_validation, test_rest,
        test_binary_output, test_stdio, test_deploy, test_transport_errors]
 

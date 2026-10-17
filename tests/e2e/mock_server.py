@@ -83,6 +83,93 @@ SOBJECTS = {
 }
 
 
+# A describe response, with the parts that vary chosen to be awkward:
+#
+#   * referenceTo as an empty list (a text field), a one-element list (an
+#     ordinary lookup) and a two-element list (a polymorphic reference such as
+#     OwnerId, which may be a User or a Queue).
+#   * precision and scale both 0 on the text fields, and non-zero on the
+#     currency ones, so a renderer has to cope with "not applicable" rather than
+#     printing 0,0 on every row.
+#   * a relationshipName of null, which is what every non-relationship field
+#     carries.
+#   * a child relationship with no relationshipName, which happens when the
+#     relationship has never been named.
+#   * a record type that is not active and not available, so the table shows a
+#     row that is entirely false apart from its identity.
+DESCRIBE_ACCOUNT = {
+    "name": "Account",
+    "label": "Account",
+    "labelPlural": "Accounts",
+    "keyPrefix": "001",
+    "custom": False,
+    "createable": True,
+    "deletable": True,
+    "queryable": True,
+    "retrieveable": True,
+    "searchable": True,
+    "triggerable": True,
+    "undeletable": True,
+    "updateable": True,
+    "fields": [
+        {"name": "Id", "label": "Account ID", "type": "id", "length": 18,
+         "precision": 0, "scale": 0, "relationshipName": None,
+         "referenceTo": [], "custom": False, "filterable": True,
+         "nillable": False, "createable": False, "updateable": False,
+         "unique": False, "idLookup": False, "nameField": True,
+         "label": "Account ID"},
+        {"name": "Name", "label": "Account Name", "type": "string",
+         "length": 255, "precision": 0, "scale": 0, "relationshipName": None,
+         "referenceTo": [], "custom": False, "filterable": True,
+         "nillable": False, "createable": True, "updateable": True,
+         "unique": False, "nameField": False},
+        {"name": "ParentId", "label": "Parent Account ID", "type": "reference",
+         "length": 18, "precision": 0, "scale": 0,
+         "relationshipName": "Account", "referenceTo": ["Account"],
+         "custom": False, "filterable": True, "nillable": False,
+         "createable": True, "updateable": True, "unique": False},
+        {"name": "OwnerId", "label": "Owner ID", "type": "reference",
+         "length": 18, "precision": 0, "scale": 0, "relationshipName": None,
+         "referenceTo": ["User", "Group"], "custom": False,
+         "filterable": True, "nillable": False, "createable": True,
+         "updateable": True, "unique": False},
+        {"name": "AnnualRevenue", "label": "Annual Revenue",
+         "type": "currency", "length": 18, "precision": 18, "scale": 0,
+         "relationshipName": None, "referenceTo": [], "custom": False,
+         "filterable": True, "nillable": True, "createable": True,
+         "updateable": True, "unique": False},
+        {"name": "SLAExpirationDate__c", "label": "SLA Expiration Date",
+         "type": "datetime", "length": 0, "precision": 0, "scale": 0,
+         "relationshipName": None, "referenceTo": [], "custom": True,
+         "filterable": True, "nillable": True, "createable": True,
+         "updateable": True, "unique": False},
+    ],
+    "childRelationships": [
+        {"childSObject": "Contact", "field": "AccountId",
+         "relationshipName": "Contacts", "fieldRequiredToCreate": False,
+         "cascadeDelete": True},
+        {"childSObject": "Opportunity", "field": "AccountId",
+         "relationshipName": "Opportunities", "fieldRequiredToCreate": False,
+         "cascadeDelete": False},
+        # No relationshipName: a child that has never been given one.
+        {"childSObject": "AccountShare", "field": "AccountId",
+         "relationshipName": None, "fieldRequiredToCreate": False,
+         "cascadeDelete": True},
+    ],
+    "recordTypeInfos": [
+        {"recordTypeId": "012000000000000AAA", "name": "Master",
+         "developerName": "Master", "active": True, "available": True,
+         "master": True, "defaultRecordTypeMapping": True},
+        {"recordTypeId": "012000000000000BBB", "name": "Customer",
+         "developerName": "Customer", "active": True, "available": True,
+         "master": False, "defaultRecordTypeMapping": False},
+        {"recordTypeId": "012000000000000CCC", "name": "Partner",
+         "developerName": "Partner", "active": False, "available": False,
+         "master": False, "defaultRecordTypeMapping": False},
+    ],
+}
+
+
 class _State:
     """Per-server state, kept off the handler so tests can inspect it."""
 
@@ -214,6 +301,9 @@ class Handler(BaseHTTPRequestHandler):
 
         if self._path_is("/services/data/{version}/sobjects"):
             return self._send_json(200, SOBJECTS)
+
+        if self._path_is("/services/data/{version}/sobjects/Account/describe"):
+            return self._send_json(200, DESCRIBE_ACCOUNT)
 
         if self._path_is("/services/data/{version}/sobjects/Account/001000000000000AAA"):
             return self._send_json(200, {"Id": "001000000000000AAA",
