@@ -29,7 +29,14 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from mock_server import (BLOB, MOCK_CLIENT_ID, MOCK_SECRET, MockSalesforce,
-                         STATE)
+                         RETRIEVE_ZIP, STATE)
+
+# The SOAP envelopes the mock has received, read live: most of the
+# assertions here are about what the client sent, and the only way to see
+# that is from here. The mock clears the list in place on start, so this
+# alias stays valid.
+SOAP_BODIES = STATE.soap_bodies
+MOCK = STATE
 
 IS_WINDOWS = os.name == "nt"
 
@@ -109,6 +116,19 @@ class Client:
 
     def path_in(self, name):
         return os.path.join(self.workdir, name)
+
+    def write(self, name, text):
+        """Put a file in the workdir and return its path.
+
+        The tests needing a manifest on disk rather than on the command line go
+        through here, so it is cleaned up along with everything else.
+        Destinations come from path_in() -- returning both from here once made an
+        output path collide with the manifest it was meant to sit beside.
+        """
+        p = self.path_in(name)
+        with open(p, "w") as fh:
+            fh.write(text)
+        return p
 
 
 def make_package(workdir):
@@ -233,6 +253,188 @@ def _rows(section_lines):
     if section_lines and section_lines[0].split()[:1] == ["ID"]:
         return section_lines[1:]
     return section_lines
+
+
+PACKAGE_XML = """<?xml version="1.0" encoding="UTF-8"?>
+<Package xmlns="http://soap.sforce.com/2006/04/metadata">
+    <types>
+        <members>*</members>
+        <name>ApexClass</name>
+    </types>
+    <version>64.0</version>
+</Package>
+"""
+
+# The realistic version of the same mistake: the root carries a prefix.
+PACKAGE_XML_PREFIXED = """<?xml version="1.0" encoding="UTF-8"?>
+<md:Package xmlns:md="http://soap.sforce.com/2006/04/metadata">
+    <md:types><md:members>*</md:members><md:name>ApexClass</md:name></md:types>
+</md:Package>
+"""
+
+
+def test_retrieve(c, r):
+    """Metadata retrieve over SOAP.
+
+    The org-facing behaviour here is the request, so the mock records every SOAP
+    envelope it receives and the assertions are mostly about what went out. The
+    archive is checked byte-exact, because the payload is binary and contains a
+    NUL early on: a client that treats it as a C string writes a truncated file
+    and reports success.
+    """
+    r.section("retrieve: the archive is written byte-exact")
+    before = len(SOAP_BODIES)
+    path = c.write("package.xml", PACKAGE_XML)
+    out = c.path_in("out.zip")
+    rc, so, se = c.run("retrieve", path, "--out", out,
+                       "--retrieve-poll-interval", "1")
+    if rc == 0:
+        r.ok("retrieve exits 0")
+    else:
+        r.bad("retrieve exits 0", "rc=%d err=%s" % (rc, se))
+    r.contains(so, "Succeeded", "reports the org's status")
+    r.check(os.path.exists(out), "the archive file exists", out)
+    if os.path.exists(out):
+        got = open(out, "rb").read()
+        r.check(got == RETRIEVE_ZIP,
+                "the archive matches byte for byte (%d bytes)" % len(got),
+                "got %r" % got[:80])
+
+    r.section("retrieve: it polls rather than assuming the first answer is final")
+    # The progress line reports the most recent status, so after a completed
+    # retrieve it reads Succeeded. What proves polling happened is the exchange
+    # count below; this checks the line a person watching actually sees.
+    r.contains(se, "retrieve", "progress names the operation")
+    r.contains(se, "elapsed,", "and shows elapsed time")
+    r.contains(se, "left of", "and how much of the budget is left")
+    m = re.search(r"(\d+)s elapsed, (\d+)s left of (\d+)s", se)
+    r.check(m is not None, "the counts are three integers",
+            repr(se[-200:]))
+    if m:
+        elapsed, left, budget = (int(g) for g in m.groups())
+        r.check(budget > 0 and left <= budget and elapsed <= budget,
+                "and they are consistent with each other",
+                "elapsed=%d left=%d budget=%d" % (elapsed, left, budget))
+    # Only the POST has a body, so the request log is where the exchanges are
+    # counted -- SOAP_BODIES would only ever show the one that was sent a body.
+    soap_calls = [q for q in MOCK.requests[before:] if q[1].startswith("/services/Soap/")]
+    r.check(len(soap_calls) >= 2, "more than one SOAP exchange happened",
+            "%d" % len(soap_calls))
+
+    r.section("retrieve: the envelope carries what the SOAP binding requires")
+    env = SOAP_BODIES[before] if SOAP_BODIES[before:] else ""
+    r.contains(env, 'xmlns="http://soap.sforce.com/2006/04/metadata"',
+               "the metadata namespace is the default")
+    r.contains(env, "SessionHeader", "the session header is present")
+    r.contains(env, "<apiVersion>64.0</apiVersion>",
+               "the API version is bare, with no v prefix")
+    r.lacks(env, "<apiVersion>v64.0</apiVersion>",
+            "and not in the REST spelling")
+    r.contains(env, "<unpackaged>", "the request wraps the manifest")
+
+    r.section("retrieve: the manifest is copied across, not reparsed")
+    r.contains(env, "<name>ApexClass</name>", "the manifest's types survived")
+    r.contains(env, "<members>*</members>", "including the wildcard member")
+    # The session id must not be percent-encoded: sfcc_buf_append_encoded is the
+    # URL encoder and using it here produced ...%21...%3D%3D, which the org
+    # cannot match against a real session id.
+    r.lacks(env, "%3D", "the session id is not percent-encoded")
+
+    r.section("retrieve: both calls go to the SOAP endpoint")
+    actions = [q for q in MOCK.requests if q[1].startswith("/services/Soap/")]
+    r.check(len(actions) >= 2, "both calls hit the SOAP endpoint",
+            repr(actions))
+    r.check(all(q[1].startswith("/services/Soap/m/")
+                for q in actions),
+            "on the versioned metadata SOAP path", repr(actions))
+
+    r.section("retrieve: SOAPAction is empty, as the Metadata binding requires")
+    # The mock faults any named action, the way a real org did when this sent
+    # SOAPAction: "retrieve" and the body was validated against the wrong schema
+    # -- which surfaced as <unpackaged> being reported invalid. A retrieve that
+    # completes is therefore the proof, and it is asserted above; this pins the
+    # reason so the connection is not accidental.
+    # The mock faults any named SOAPAction, so a retrieve that completes at all
+    # is the proof. Stated here because the previous version of this assertion
+    # depended on a status string that the progress line no longer leaves last.
+    r.check("Unexpected SOAPAction" not in se,
+            "no named SOAPAction was rejected", repr(se[-200:]))
+    r.section("retrieve: the URL carries the bare version, not the REST one")
+    # A real org answers /services/Soap/m/v64.0 with "Invalid Api version
+    # specified on URL". The envelope was already bare; the path was not, and a
+    # permissive regex in the mock let that through to a real org. Both spellings
+    # are asserted here so the path cannot regress on its own.
+    paths = [q[1] for q in MOCK.requests if q[1].startswith("/services/Soap/")]
+    r.check(all("/services/Soap/m/64.0" in q for q in paths),
+            "the path is /services/Soap/m/64.0", repr(paths))
+    r.lacks(" ".join(paths), "/m/v64.0", "and never the v-prefixed form")
+
+    r.section("retrieve: a slow retrieve reports more than once")
+    # Redirected, the progress lines are throttled by the reporter rather than
+    # rewritten, so a CI log gets a readable history instead of 180 identical
+    # lines. This needs a retrieve that stays Pending long enough to emit any.
+    path = c.write("package.xml",
+                   PACKAGE_XML.replace("ApexClass", "PollMany"))
+    rc, so, se = c.run("retrieve", path, "--out", c.path_in("slow.zip"),
+                       "--retrieve-poll-interval", "1")
+    r.check(rc == 0, "the slow retrieve still completes", se[-200:])
+    lines = [l for l in se.splitlines() if "elapsed," in l]
+    r.check(len(lines) >= 2,
+            "more than one progress line when stderr is redirected",
+            "%d lines: %r" % (len(lines), lines))
+    r.check(all(l.endswith("s") and "left of" in l for l in lines),
+            "each is a complete standalone line", repr(lines))
+    r.lacks(se, "\r",
+            "and there are no carriage returns when redirected")
+
+    r.section("retrieve: a failed retrieve names the org's own reason")
+    path = c.write("package.xml",
+                   PACKAGE_XML.replace("ApexClass", "FailMe"))
+    out2 = c.path_in("failed.zip")
+    rc, so, se = c.run("retrieve", path, "--out", out2,
+                       "--retrieve-poll-interval", "1")
+    r.check(rc != 0, "a failed retrieve exits nonzero", "rc=%d" % rc)
+    r.contains(se, "No component retrieved",
+               "the org's problem text is reported, not just 'Failed'")
+    r.contains(se, "&", "and its XML entity was unescaped")
+    r.check(not os.path.exists(out2),
+            "and no empty archive is left behind", out2)
+
+    r.section("retrieve: a bad manifest never reaches the network")
+    for label, text, needle in (
+            ("truncated", PACKAGE_XML[:PACKAGE_XML.index("<version")],
+             "truncated"),
+            ("prefixed", PACKAGE_XML_PREFIXED, "namespace prefix"),
+            ("not a manifest", "<html>nope</html>", "no <Package>")):
+        n = len(SOAP_BODIES)
+        path = c.write("package.xml", text)
+        rc, so, se = c.run("retrieve", path, "--out",
+                           os.path.join(c.workdir, "never.zip"),
+                           "--retrieve-poll-interval", "1")
+        r.check(rc != 0, "%s manifest exits nonzero" % label, "rc=%d" % rc)
+        r.contains(se, needle, "%s manifest explains itself" % label)
+        r.check(len(SOAP_BODIES) == n,
+                "%s manifest sends no SOAP at all" % label,
+                "%d new envelopes" % (len(SOAP_BODIES) - n))
+
+    r.section("retrieve: a missing manifest is reported, not crashed on")
+    rc, so, se = c.run("retrieve",
+                       os.path.join(c.workdir, "nope.xml"),
+                       "--out", os.path.join(c.workdir, "never2.zip"))
+    r.check(rc != 0, "a missing manifest exits nonzero", "rc=%d" % rc)
+    r.contains(se, "cannot read", "and says it could not be read")
+
+    r.section("retrieve: arguments")
+    rc, so, se = c.run("retrieve")
+    r.check(rc != 0, "no arguments exits nonzero", "rc=%d" % rc)
+    r.contains(se, "package.xml", "and says what it wanted")
+
+    rc, so, se = c.run("retrieve", path, path)
+    r.check(rc != 0, "two manifests exits nonzero", "rc=%d" % rc)
+
+    rc, so, se = c.run("retrieve", path, "--retrieve-timeout", "0")
+    r.check(rc != 0, "--retrieve-timeout 0 is rejected", "rc=%d" % rc)
+    r.contains(se, "positive", "with a clear reason")
 
 
 def test_describe(c, r):
@@ -738,7 +940,7 @@ def test_transport_errors(c, r):
 
 # --------------------------------------------------------------------------
 
-ALL = [test_auth, test_query, test_sobjects, test_describe,
+ALL = [test_auth, test_query, test_sobjects, test_describe, test_retrieve,
        test_records,
        test_validation, test_rest,
        test_binary_output, test_stdio, test_deploy, test_transport_errors]

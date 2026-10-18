@@ -221,6 +221,19 @@ add_test(NAME cli_describe_field_needs_a_value COMMAND sfcc_cli describe Account
 set_tests_properties(cli_describe_field_needs_a_value PROPERTIES
   PASS_REGULAR_EXPRESSION "needs a value")
 
+# Credentials are supplied so the run gets past the credential gate, which is
+# checked before the argument count -- otherwise this would pass on "no
+# credentials" and assert nothing about retrieve at all.
+add_test(NAME cli_retrieve_needs_a_manifest
+  COMMAND sfcc_cli retrieve --instance http://127.0.0.1:1 --token dummy)
+set_tests_properties(cli_retrieve_needs_a_manifest PROPERTIES
+  PASS_REGULAR_EXPRESSION "package.xml")
+
+add_test(NAME cli_retrieve_timeout_must_be_positive
+  COMMAND sfcc_cli retrieve pkg.xml --retrieve-timeout 0)
+set_tests_properties(cli_retrieve_timeout_must_be_positive PROPERTIES
+  PASS_REGULAR_EXPRESSION "positive")
+
 # --- end-to-end -------------------------------------------------------------
 #
 # The tests above cover units and CLI argument handling with no server. This one

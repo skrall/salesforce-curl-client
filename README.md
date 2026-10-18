@@ -121,6 +121,7 @@ Sandboxes use `--login-url https://test.salesforce.com`.
 | `versions` | API versions this org supports |
 | `rest <path>` | One raw REST call, with auth applied |
 | `deploy --zip <file>` | Deploy a prebuilt metadata package |
+| `retrieve <package.xml>` | Fetch metadata named by a manifest into a `.zip` |
 
 | Option | Description |
 | --- | --- |
@@ -226,6 +227,61 @@ A few things the tables make explicit that the raw JSON leaves to be inferred:
 
 Note that `--json` exists because `describe` used to print indented JSON by
 default. Piping it into `jq` still works, without `--raw`.
+
+### Retrieving metadata
+
+```console
+$ sfcc retrieve package.xml --out build/metadata.zip
+retrieve 0Af1B000000XXXX: Pending... (this can take minutes)
+retrieved build/metadata.zip (Succeeded, 2401931 bytes)
+```
+
+Then unpack it with anything, and deploy it straight back:
+
+```sh
+unzip -q build/metadata.zip -d metadata
+sfcc deploy --zip build/metadata.zip
+```
+
+| Option | Description |
+| --- | --- |
+| `--out <file.zip>` | Where to write the archive (default `metadata.zip`) |
+| `--retrieve-poll-interval <s>` | Status poll interval (default 5) |
+| `--retrieve-timeout <s>` | Give up waiting after this long (default 900) |
+
+Both `retrieve` and `deploy` report while they wait, with the elapsed time and
+what is left of the budget:
+
+```
+  retrieve 0Af1B000000XXXX: Pending... 3s elapsed, 897s left of 900s
+```
+
+On a terminal that is one line rewritten in place, so it shows movement rather
+than filling the scrollback. Redirected — a CI log, a file — the same text is
+written as standalone lines, throttled to one per poll interval.
+
+**This is the one command that is not REST.** The Metadata API has a REST
+resource for deploy but not for retrieve — Salesforce's own CLI and jsforce both
+use SOAP for this, `performRetrieve` is documented as "Reserved for future use",
+and a search of public code turns up nobody retrieving over REST. So this is the
+client's only non-REST transport, kept as small as the operation allows.
+
+**The archive is written as received and is not unpacked.** The Metadata API
+returns one base64 `zipFile` and no per-file content, so there is nothing else to
+write. That is not only a shortcut: no path inside the archive is ever used, so
+the zip-slip class of problem — a hostile org returning `../../../.ssh/…` —
+cannot arise here at all.
+
+**The manifest is not parsed either.** Its `<Package>` element has the same shape
+and the same default namespace as the `<unpackaged>` element the SOAP request
+wants, so the contents are copied across verbatim. A manifest that writes
+`<Package>` with a namespace prefix is refused with an explanation rather than
+sent in the wrong namespace, where the org would answer with an opaque fault.
+
+The API version comes from `--api-version`, like every other command, rather than
+from the manifest. Note that Salesforce still lets a `<version>` inside the
+manifest govern the shape of the components returned, so it is not fully
+authoritative either way.
 
 ### The `rest` escape hatch
 

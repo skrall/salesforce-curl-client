@@ -143,7 +143,8 @@ add_library(sfcc STATIC
   src/sfcc_auth.c
   src/sfcc_client.c
   src/sfcc_deploy.c
-  src/sfcc_rest.c)
+  src/sfcc_rest.c
+  src/sfcc_soap.c)
 
 target_include_directories(sfcc
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
