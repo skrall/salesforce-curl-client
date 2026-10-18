@@ -146,6 +146,35 @@ Sandboxes use `--login-url https://test.salesforce.com`.
 | `SFCC_API_VERSION` | API version |
 | `SFCC_TOKEN_CACHE` | Token cache path |
 
+### Keeping dependencies current
+
+Dependabot watches the workflows and the Docker base image, weekly on Mondays:
+
+| Manifest | Ecosystem | Watches |
+| --- | --- | --- |
+| `.github/workflows/` | `github-actions` | `actions/checkout`, `lukka/get-cmake` |
+| `Dockerfile` | `docker` | `alpine:3.24` |
+
+Updates arrive grouped, one PR per ecosystem rather than one per dependency.
+A green PR from Dependabot merges itself once the six CI jobs pass — see
+`.github/workflows/auto-merge.yml` and the branch ruleset on `main`.
+
+What is **not** watched, and why:
+
+- **cJSON and zlib** are vendored under `third_party/` and pinned by whatever
+  revision was copied in. `cJSON` is compiled into the static library and
+  shipped in the Docker image, so changing it changes what the image contains;
+  that deserves a person rather than an unattended merge.
+- **Alpine packages** (`build-base`, `cmake`, `pkgconf`, `curl-dev`, `libcurl`,
+  `ca-certificates`) are installed from Alpine's rolling repository with no
+  version pins, so the image is not reproducible from one build to the next.
+- **vcpkg**, which supplies libcurl on Windows, is used in *classic* mode —
+  `vcpkg install curl:$TRIPLET` — resolving against whatever vcpkg commit the
+  CI runner ships. Dependabot supports vcpkg, but only `builtin-baseline` and
+  only with a `vcpkg.json` manifest, of which there is none. Adding one would
+  also make the Windows build reproducible, and is the obvious next step if that
+  matters.
+
 ### Listing what is in the org
 
 `sobjects` fetches the global object listing — API name, label, key prefix, and

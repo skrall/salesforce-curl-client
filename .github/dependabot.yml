@@ -1,0 +1,108 @@
+# Dependency updates.
+#
+# Two ecosystems, because two are the only ones this repository has a manifest for.
+# Everything else that could drift -- the vendored sources under third_party/, the
+# Alpine packages named in the Dockerfile -- is invisible to Dependabot, and the
+# last section says what would be needed to change that.
+
+version: 2
+
+updates:
+  # ---------------------------------------------------------------------
+  # Actions used by .github/workflows/
+  #
+  # Weekly rather than daily. The actions here are checkout and get-cmake, so a
+  # weekly PR is plenty of cadence for a tool whose whole surface area is a
+  # command line; daily would generate more PR-review noise than the updates are
+  # worth.
+  # ---------------------------------------------------------------------
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci"
+    groups:
+      # One pull request for all action updates rather than one per action, so a
+      # week with two actions moving produces one thing to read and one CI run
+      # instead of two of each. Grouping is the whole reason to bother with
+      # groups on an ecosystem this small: the individual PRs here would be
+      # indistinguishable noise.
+      actions:
+        patterns:
+          - "*"
+
+  # ---------------------------------------------------------------------
+  # The Alpine base image, in Dockerfile
+  #
+  # Alpine 3.24 is pinned by minor version rather than floating on 3, so this
+  # ecosystem produces "3.24 -> 3.25" style moves. A major Alpine bump is not
+  # automatic: musl changes what a static build can link against, and the reason
+  # this image is Alpine rather than Debian is a runtime resolver difference that
+  # only shows up as silent DNS failure. See the note on apk below.
+  # ---------------------------------------------------------------------
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "07:00"
+      timezone: "Etc/UTC"
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - docker
+    commit-message:
+      prefix: "docker"
+    groups:
+      docker:
+        patterns:
+          - "*"
+
+# ---------------------------------------------------------------------------
+# What is not here, and why
+#
+# C dependencies
+# --------------
+# Dependabot has no C or C++ ecosystem. It never did: the request has been open
+# since 2020 and dependabot-core closed it in January 2026 with support for vcpkg
+# in place instead. Conan and CMake FetchContent are still unimplemented.
+#
+# vcpkg is supported, and it is the one that would apply here, but two limits
+# matter:
+#
+#   1. It only bumps `builtin-baseline` -- a single commit hash that pins every
+#      port version in the registry at once. Not individual port versions.
+#   2. It needs a vcpkg.json. There is none: the Windows job installs libcurl in
+#      vcpkg's classic mode (`vcpkg install curl:$TRIPLET`), which resolves
+#      against whatever vcpkg commit the runner happens to ship.
+#
+# So declaring the vcpkg ecosystem today would find no manifest and do nothing.
+# Enabling it means adding a vcpkg.json and switching that step to manifest mode,
+# which is worth doing -- it makes the Windows build reproducible, which it
+# currently is not -- but it is its own change with its own MSVC CI round trips,
+# and it is not part of keeping the workflows current.
+#
+# The libraries this project actually links
+# -----------------------------------------
+# cJSON and zlib are vendored under third_party/ and are pinned by whatever
+# revision was copied in. Nothing tracks them. Updating them is a deliberate
+# manual task, and the reason is that both are small, stable and vendored
+# deliberately: third_party/cJSON is built into the static library and shipped in
+# the Docker image, so an update changes what the image contains and deserves to
+# be reviewed by a person rather than merged unattended.
+#
+# Alpine packages
+# ---------------
+# The Dockerfile names packages -- build-base, cmake, pkgconf, curl-dev, libcurl,
+# ca-certificates -- installed from Alpine's rolling repository with no version
+# pins. Dependabot cannot see those: they are not in a manifest it parses. Every
+# rebuild of the image can pick up a newer Alpine package, and has.
+# ---------------------------------------------------------------------------

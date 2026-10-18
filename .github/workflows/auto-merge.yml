@@ -1,0 +1,76 @@
+name: auto-merge
+
+# Merge Dependabot's pull requests once the tests have passed.
+#
+# --auto is the entire mechanism, and it is doing the real work. Without it
+# `gh pr merge` fires the moment the pull request is mergeable, which is before
+# the jobs have finished, so a red build would land on main. With it, GitHub
+# holds the merge until the branch ruleset on main is satisfied -- and that ruleset
+# is what requires the six checks to have passed.
+#
+# No third-party action is used here on purpose. This workflow runs on
+# pull_request_target, which gets a write token, and combining that with a
+# mutable third-party tag is how a compromised action ends up with write access
+# to a repository. gh is preinstalled on the runner, so the whole job is one
+# command against the API and there is nothing to keep up to date here.
+
+on:
+  pull_request_target:
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - ready_for_review
+
+permissions:
+  # contents: write is what a merge actually needs. pull-requests: write on its
+  # own is enough to enable auto-merge but not to perform the merge, so leaving it
+  # out makes the workflow fail at the worst moment: the first Dependabot pull
+  # request, days after this was merged.
+  contents: write
+  pull-requests: write
+
+# One merge at a time. Overlapping Dependabot pull requests would each hold their
+# own set of checks, and the shared e2e work they need makes that wasteful rather
+# than merely untidy.
+concurrency:
+  group: auto-merge-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  dependabot:
+    name: dependabot
+    runs-on: ubuntu-latest
+
+    # If the author is not Dependabot, do nothing at all. Dependabot is the only
+    # thing this rule is for, and a human pull request that happened to be green
+    # should never be closed by it.
+    #
+    # That guard is also what makes pull_request_target safe here: this workflow
+    # never checks out the pull request or runs any of its code, so a fork cannot
+    # reach the write token even if someone opens a pull request from one.
+    if: github.actor == 'dependabot[bot]'
+
+    steps:
+      # Merge, not squash. A squashed dependency commit is harder to revert than
+      # a merge commit, and these are changes worth being able to back out of a
+      # release with a single git revert --m.
+      #
+      # The result is a merge commit whose message is Dependabot's, pointing at
+      # its own pull request, so the provenance survives in the history.
+      - name: Enable auto-merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD: ${{ github.event.pull_request.head.ref }}
+          URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          echo "Enabling auto-merge on #$PR ($HEAD)"
+          echo "Gate: the branch ruleset on main requires all six CI checks."
+          if gh pr merge --auto --merge "$PR"; then
+            echo "Auto-merge enabled. GitHub will merge once the checks pass."
+          else
+            echo "::error::could not enable auto-merge on $URL"
+            exit 1
+          fi
