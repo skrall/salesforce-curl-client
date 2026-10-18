@@ -335,6 +335,15 @@ def test_retrieve(c, r):
                 for q in actions),
             "on the versioned metadata SOAP path", repr(actions))
 
+    r.section("retrieve: SOAPAction is empty, as the Metadata binding requires")
+    # The mock faults any named action, the way a real org did when this sent
+    # SOAPAction: "retrieve" and the body was validated against the wrong schema
+    # -- which surfaced as <unpackaged> being reported invalid. A retrieve that
+    # completes is therefore the proof, and it is asserted above; this pins the
+    # reason so the connection is not accidental.
+    r.contains(se, "Pending",
+               "the retrieve got past SOAPAction, which the mock rejects "
+               "unless empty")
     r.section("retrieve: the URL carries the bare version, not the REST one")
     # A real org answers /services/Soap/m/v64.0 with "Invalid Api version
     # specified on URL". The envelope was already bare; the path was not, and a

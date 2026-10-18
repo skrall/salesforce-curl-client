@@ -36,10 +36,23 @@
 #define SFCC_RETRIEVE_POLL_DEFAULT 5L
 #define SFCC_RETRIEVE_TIMEOUT_DEFAULT 900L   /* 15 minutes */
 
-/* SOAP 1.1 requires the SOAPAction header to be present. Salesforce accepts the
- * bare operation name; some tooling quotes it, and both are seen in the wild. */
-#define SOAPACTION_RETRIEVE "\"retrieve\""
-#define SOAPACTION_CHECK    "\"checkRetrieveStatus\""
+/*
+ * SOAPAction is sent EMPTY, as SOAP 1.1 requires it to be present and as
+ * Salesforce's Metadata binding expects: jsforce sends `SOAPAction: ""` and
+ * dispatches on the body element, not the action.
+ *
+ * Naming the operation instead -- "retrieve", "checkRetrieveStatus" -- is what
+ * this did first, and the org answered
+ *
+ *   Element {http://soap.sforce.com/2006/04/metadata}unpackaged invalid at this location
+ *
+ * Naming `unpackaged` as the offending element is the giveaway: it is a child of
+ * <retrieve>, valid in the retrieve schema, so it could only be invalid if the
+ * body were being validated against a different schema. That is what a
+ * non-empty SOAPAction causes. The element names in the body were never the
+ * problem; the header was.
+ */
+#define SOAPACTION_EMPTY "SOAPAction: \"\""
 
 void sfcc_retrieve_options_defaults(sfcc_retrieve_options* opts){
   if(opts == NULL){
@@ -604,9 +617,6 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
   build_envelope(c->api_version, c->access_token, unpacked.data, &envelope);
   sfcc_buf_free(&unpacked);
 
-  const char* action_hdr_retrieve = "SOAPAction: " SOAPACTION_RETRIEVE;
-  const char* action_hdr_check = "SOAPAction: " SOAPACTION_CHECK;
-
   /* Bare version in the path, not the REST "v64.0" spelling: the endpoint is
    * /services/Soap/m/64.0 and a real org answers the prefixed form with
    *   soapenv:Client: Invalid Api version specified on URL : /m/v64.0
@@ -619,7 +629,7 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
 
   sfcc_buf doc;
   sfcc_buf_init(&doc);
-  rc = soap_call(c, SFCC_HTTP_POST, endpoint.data, action_hdr_retrieve,
+  rc = soap_call(c, SFCC_HTTP_POST, endpoint.data, SOAPACTION_EMPTY,
                  envelope.data, &doc);
   sfcc_buf_free(&envelope);
   if(rc != SFCC_OK){
@@ -670,7 +680,7 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
      * and a retrieve that runs for a quarter of an hour would otherwise hold
      * every intermediate response until it finished. */
     sfcc_buf_free(&doc);
-    rc = soap_call(c, SFCC_HTTP_GET, endpoint.data, action_hdr_check, NULL,
+    rc = soap_call(c, SFCC_HTTP_GET, endpoint.data, SOAPACTION_EMPTY, NULL,
                    &doc);
     if(rc != SFCC_OK){
       sfcc_buf_free(&endpoint);

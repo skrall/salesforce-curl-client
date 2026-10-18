@@ -349,10 +349,28 @@ class Handler(BaseHTTPRequestHandler):
         return re.match("^" + regex + "$", u.path) is not None
 
     def _soap_action(self):
-        """The SOAPAction header, unquoted. Absent entirely is a real failure
-        mode: SOAP 1.1 requires it, so a client that omits it is broken."""
-        raw = self.headers.get("SOAPAction") or ""
-        return raw.strip().strip('"')
+        """The SOAPAction header, stripped of quotes.
+
+        Salesforce's Metadata binding expects this EMPTY -- jsforce sends
+        SOAPAction: "" and dispatches on the body element, not the action. The
+        mock now does the same, and answers a named action with the fault a real
+        org returns, because sending "retrieve" here got the body validated
+        against the wrong schema and the org blamed <unpackaged>.
+        """
+        raw = (self.headers.get("SOAPAction") or "").strip().strip('"')
+        return raw
+
+    def _soap_guard(self):
+        """Reject the request unless it looks like the Metadata SOAP binding
+        expects: an empty SOAPAction, and a body element naming the operation."""
+        if self._soap_action():
+            self._soap_fault(
+                "soapenv:Client",
+                "Unexpected SOAPAction %r for the Metadata binding: it is "
+                "dispatched on the body element and must be empty"
+                % self._soap_action())
+            return True
+        return False
 
     def _soap(self):
         """True when this is a Metadata SOAP endpoint, whatever the operation.
@@ -383,7 +401,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
 
-        if self._soap() and self._soap_action() == "checkRetrieveStatus":
+        if self._soap():
+            if self._soap_guard():
+                return
             rid = "0Af1B000000RetrieveAAA"
             if rid == "unknown":
                 return self._soap_fault("sf:INVALID_ID", "no such retrieve")
@@ -532,7 +552,9 @@ class Handler(BaseHTTPRequestHandler):
         raw = self._body()
         u = urlparse(self.path)
 
-        if self._soap() and self._soap_action() == "retrieve":
+        if self._soap() and "<retrieve>" in raw.decode("utf-8", "replace"):
+            if self._soap_guard():
+                return
             body = raw.decode("utf-8", "replace")
             with STATE.lock:
                 STATE.soap_bodies.append(body)
