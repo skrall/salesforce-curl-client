@@ -54,6 +54,17 @@ permissions:
   contents: write
   pull-requests: write
 
+  # Read-only, and only so the guard step below can see whether the required
+  # checks are still configured on the default branch.
+  #
+  # This is read rather than write deliberately: administration: write would let
+  # this workflow delete the repository, and it runs on pull_request_target. The
+  # read-only form is what the guard actually needs, and it is enough -- verified
+  # by running it, because the obvious answer was wrong. Without this key the step
+  # fails with "Resource not accessible by integration (HTTP 403)", which means
+  # the guard can never pass and the workflow is dead on arrival.
+  administration: read
+
 # One merge at a time. Overlapping pull requests would each hold their own set of
 # checks, and the shared e2e work they need makes that wasteful rather than merely
 # untidy.
