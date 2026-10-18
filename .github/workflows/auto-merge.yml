@@ -22,6 +22,30 @@ on:
       - reopened
       - ready_for_review
 
+  # A way to arm this by hand, on any pull request, at any time.
+  #
+  # It exists because the automatic path can only be exercised by a Dependabot
+  # pull request appearing on its weekly schedule, which leaves the interesting
+  # half of this workflow -- does --auto actually arm, then wait, then merge --
+  # untested until one does. That is not hypothetical: the first Dependabot run
+  # found a bug in the command below within minutes of the config landing, and a
+  # workflow whose only trigger is a schedule means the next such bug is found on
+  # an unattended merge instead.
+  #
+  # Dispatching needs write access, which is the same permission as merging, so
+  # this grants nobody anything they did not already have.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to arm auto-merge on"
+        required: true
+        type: string
+      dry-run:
+        description: "Check the gate and report, without arming the merge"
+        required: false
+        default: false
+        type: boolean
+
 permissions:
   # contents: write is what a merge actually needs. pull-requests: write on its
   # own is enough to enable auto-merge but not to perform the merge, so leaving it
@@ -30,11 +54,15 @@ permissions:
   contents: write
   pull-requests: write
 
-# One merge at a time. Overlapping Dependabot pull requests would each hold their
-# own set of checks, and the shared e2e work they need makes that wasteful rather
-# than merely untidy.
+# One merge at a time. Overlapping pull requests would each hold their own set of
+# checks, and the shared e2e work they need makes that wasteful rather than merely
+# untidy.
+#
+# Not a fixed prefix: the dispatched group has to differ from the automatic one,
+# or a manual run against a pull request that already has one queued would queue
+# behind it and never report.
 concurrency:
-  group: auto-merge-${{ github.event.pull_request.number }}
+  group: auto-merge-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: false
 
 jobs:
@@ -49,7 +77,18 @@ jobs:
     # That guard is also what makes pull_request_target safe here: this workflow
     # never checks out the pull request or runs any of its code, so a fork cannot
     # reach the write token even if someone opens a pull request from one.
-    if: github.actor == 'dependabot[bot]'
+    # On the automatic path, do nothing at all unless the author is Dependabot.
+    # A human pull request that happened to be green should never be closed by
+    # this rule; if you want one merged, merge it.
+    #
+    # That guard is also what makes pull_request_target safe here: this workflow
+    # never checks out the pull request or runs any of its code, so a fork cannot
+    # reach the write token even if someone opens a pull request from one.
+    #
+    # A dispatched run is an explicit request by someone with write access, so it
+    # is let through -- and the next step still refuses to act on a pull request
+    # whose branch lives in a fork.
+    if: github.actor == 'dependabot[bot]' || github.event_name == 'workflow_dispatch'
 
     steps:
       # Refuse to arm the merge unless the gate it relies on is actually in place.
@@ -63,12 +102,39 @@ jobs:
       #
       # A 404 here -- no protection configured -- fails the step, which fails the
       # job, which is the intended outcome.
+      # Work out which pull request, and refuse one whose branch is in a fork.
+      #
+      # Refusing here rather than relying on the trigger alone: a fork can open a
+      # pull request against this repository, and a dispatched run naming one
+      # would otherwise arm a merge of somebody else's branch.
+      - name: Resolve the target
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PR" ]; then
+            echo "::error::no pull request number; pass one as an input"
+            exit 1
+          fi
+          head_repo=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.repo.full_name')
+          echo "Pull request #$PR, head repository: $head_repo"
+          if [ "$head_repo" != "$REPO" ]; then
+            echo "::error::#$PR comes from $head_repo, not this repository."
+            echo "::error::a fork's branch must never be merged by this workflow."
+            exit 1
+          fi
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+          echo "head=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.ref')" >> "$GITHUB_OUTPUT"
+          echo "url=$(gh api "repos/$REPO/pulls/$PR" --jq '.html_url')" >> "$GITHUB_OUTPUT"
+
       - name: Confirm the gate still exists
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.event.repository.default_branch }}
-          PR: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
           echo "Checking required status checks on $BRANCH of $REPO"
@@ -104,15 +170,20 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-          HEAD: ${{ github.event.pull_request.head.ref }}
-          URL: ${{ github.event.pull_request.html_url }}
+          PR: ${{ steps.target.outputs.number }}
+          HEAD: ${{ steps.target.outputs.head }}
+          URL: ${{ steps.target.outputs.url }}
+          DRY: ${{ inputs.dry-run }}
         run: |
           set -euo pipefail
           echo "Enabling auto-merge on #$PR ($HEAD)"
           echo "Gate: the branch policy on the default branch requires all six CI checks."
+          if [ "$DRY" = "true" ]; then
+            echo "Dry run: stopping before the merge is armed."
+            exit 0
+          fi
           if gh pr merge --auto --merge "$PR" --repo "$REPO"; then
-            echo "Auto-merge enabled. GitHub will merge once the checks pass."
+            echo "Auto-merge armed. GitHub will merge once the checks pass."
           else
             echo "::error::could not enable auto-merge on $URL"
             exit 1
