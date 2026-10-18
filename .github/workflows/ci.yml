@@ -38,7 +38,7 @@ jobs:
     env:
       CC: ${{ matrix.cc }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -104,7 +104,7 @@ jobs:
     name: end-to-end
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install build dependencies
         run: |
@@ -130,7 +130,7 @@ jobs:
     name: macos
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install libcurl
         run: brew install curl
@@ -172,7 +172,7 @@ jobs:
     env:
       VCPKG_TARGET_TRIPLET: x64-windows
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # Pinned to a release rather than @latest. Dependabot can only offer an
       # update when it can see a version, and @latest tells it nothing -- so the
@@ -270,7 +270,7 @@ jobs:
     name: source hygiene
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: No tabs or trailing whitespace in our C sources
         # third_party is excluded deliberately: that is cJSON's code, not ours,
