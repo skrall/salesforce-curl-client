@@ -174,8 +174,14 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Pinned to a release rather than @latest. Dependabot can only offer an
+      # update when it can see a version, and @latest tells it nothing -- so the
+      # one action in this workflow that is not a well-known first-party step was
+      # the one step nothing was watching. It is also the only third-party action
+      # in the file, and a floating tag resolves to whatever the tag points at on
+      # the day the job runs.
       - name: Set up CMake
-        uses: lukka/get-cmake@latest
+        uses: lukka/get-cmake@v4.4.4
         with:
           cmakeVersion: '>=3.21'
 
