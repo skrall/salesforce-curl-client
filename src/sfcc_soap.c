@@ -581,11 +581,27 @@ static sfcc_status write_file(const char* path, const char* data, size_t n){
 static sfcc_status soap_call(sfcc_client* c, sfcc_method method,
                              const char* url, const char* action,
                              const char* body, sfcc_buf* out){
-  const char* headers[] = { action, NULL };
+  /*
+   * Exactly "text/xml", with no charset parameter, on every call.
+   *
+   * Both halves of that were wrong. A real org answers
+   *
+   *   soapenv:Client: content-type of the request should be text/xml
+   *
+   * for "text/xml; charset=UTF-8", and for a request carrying no Content-Type
+   * at all -- which is what the poll sent, because sfcc_http_request_ex only
+   * sets Content-Type when there is a body, and the poll has none. jsforce
+   * sends the bare 'text/xml' on both.
+   *
+   * So it goes in as an explicit header rather than as the content_type
+   * argument: that argument is ignored without a body, and the header list is
+   * honoured either way. One place sets it, and the bodyless poll is covered by
+   * the same expression.
+   */
+  const char* headers[] = { action, "Content-Type: text/xml", NULL };
   sfcc_response resp;
   const sfcc_status rc = sfcc_http_request_ex(
-      c, method, url, c->access_token, body,
-      (body != NULL) ? "text/xml; charset=UTF-8" : NULL, headers, &resp);
+      c, method, url, c->access_token, body, NULL, headers, &resp);
   if(rc != SFCC_OK){
     return rc;
   }

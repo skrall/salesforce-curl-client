@@ -397,6 +397,17 @@ class Handler(BaseHTTPRequestHandler):
                 % self._soap_action())
             return True
 
+        # Exactly "text/xml". A charset parameter is rejected, and so is a
+        # request with no Content-Type at all -- which is what the poll sent
+        # while the HTTP layer omits the header when there is no body.
+        ctype = (self.headers.get("Content-Type") or "").strip().lower()
+        if ctype != "text/xml":
+            self._soap_fault(
+                "soapenv:Client",
+                "content-type of the request should be text/xml (got %r)"
+                % (ctype or "(none)"))
+            return True
+
         # checkRetrieveStatus is a GET with no body, so there is nothing to
         # check beyond the action. Only the retrieve POST carries an envelope.
         if not body:
