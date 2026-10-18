@@ -75,6 +75,28 @@ int   sfcc_buf_append_xml(sfcc_buf* b, const char* src);
 void  sfcc_buf_free(sfcc_buf* b);
 
 /* ------------------------------------------------------------------------ */
+/* One-line progress feedback for an asynchronous operation.
+ *
+ * Both metadata deploy and retrieve are long-running polls, and a single
+ * "this can take minutes" line is no use to someone deciding whether the process
+ * has hung. This reports the elapsed time and the remaining budget, rewriting one
+ * line in place on a terminal and writing throttled lines otherwise.
+ *
+ * Nothing here is thread-safe and nothing needs to be: the caller is the single
+ * polling loop.
+ */
+typedef struct {
+  int  tty;        /* stderr is a terminal: rewrite in place rather than append */
+  int  width;      /* columns the previous line occupied, to erase it        */
+  long last_emit;  /* elapsed seconds when the last line was written        */
+} sfcc_progress;
+
+void sfcc_progress_init(sfcc_progress* p);
+void sfcc_progress_report(sfcc_progress* p, const char* op, const char* id,
+                          const char* status, long elapsed_s, long budget_s,
+                          long interval_s);
+void sfcc_progress_finish(sfcc_progress* p);
+
 /* Strings and paths                                                        */
 /* ------------------------------------------------------------------------ */
 

@@ -411,7 +411,8 @@ static sfcc_status poll_status(sfcc_client* c, const char* id,
 
   sfcc_status rc = SFCC_OK;
   const time_t start = time(NULL);
-  int announced = 0;
+  sfcc_progress prog;
+  sfcc_progress_init(&prog);
 
   for(;;){
     sfcc_response resp;
@@ -437,12 +438,10 @@ static sfcc_status poll_status(sfcc_client* c, const char* id,
     if(out->done){
       break;
     }
-    /* Say something once, so a long poll is not a silent hang. */
-    if(!announced){
-      announced = 1;
-      fprintf(stderr, "  deploy %s: %s... (this can take minutes)\n", id,
-              out->status ? out->status : "in progress");
-    }
+    /* Every poll, not once: the elapsed and remaining counts are what show the
+     * work is still inside its budget. */
+    sfcc_progress_report(&prog, "deploy", id, out->status,
+                         (long)(time(NULL) - start), budget, interval);
     if(time(NULL) - start >= budget){
       rc = sfcc_fail(c, SFCC_ERR_NET,
                      "gave up waiting after %lds; the deploy may still be "

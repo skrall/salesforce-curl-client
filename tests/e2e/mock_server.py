@@ -199,6 +199,7 @@ class _State:
         # construction testable at all.
         self.soap_bodies = []
         self.soap_polls = {}    # retrieve id -> number of checkStatus calls
+        self.soap_slow = {}     # retrieve id -> how many Pending rounds
         self.lock = threading.Lock()
 
     def record(self, method, path, auth, ctype):
@@ -661,10 +662,12 @@ class Handler(BaseHTTPRequestHandler):
             with STATE.lock:
                 n = STATE.soap_polls.get(rid, 0)
                 STATE.soap_polls[rid] = n + 1
-            # Pending once, then Succeeded. Polling is the thing worth forcing:
-            # a client that treats the first response as final would never see
-            # the archive and would fail here for the right reason.
-            if n < 1:
+                slow_until = STATE.soap_slow.get(rid, 1)
+            # Pending until slow_until, then Succeeded. Polling is the thing
+            # worth forcing: a client that treats the first response as final
+            # would never see the archive and would fail here for the right
+            # reason.
+            if n < slow_until:
                 return self._send_raw(
                     200, (RETRIEVE_PENDING_SOAP % rid).encode("utf-8"),
                     "text/xml")
@@ -696,8 +699,13 @@ class Handler(BaseHTTPRequestHandler):
                     .encode("utf-8"), "text/xml")
 
             rid = "0Af1B000000RetrieveAAA"
+            # A manifest naming PollMany asks the mock to stay Pending for
+            # several rounds, which is the only way to see more than one
+            # progress line -- the ordinary retrieve finishes on the second poll.
+            slow = "PollMany" in body
             with STATE.lock:
                 STATE.soap_polls[rid] = 0
+                STATE.soap_slow[rid] = 5 if slow else 1
             # Pending, as a real org answers: retrieve is asynchronous, and a
             # mock that returned the archive here would mean the poll loop is
             # never executed by any test.

@@ -756,7 +756,8 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
 
   /* --- poll -------------------------------------------------------------- */
   const time_t start = time(NULL);
-  int announced = 0;
+  sfcc_progress prog;
+  sfcc_progress_init(&prog);
   int first_poll = 1;
 
   while(!result->done){
@@ -802,13 +803,18 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
     }
     parse_status(doc.data ? doc.data : "", result);
 
-    if(!announced){
-      announced = 1;
-      fprintf(stderr, "  retrieve %s: %s... (this can take minutes)\n",
-              result->id ? result->id : "?",
-              result->status ? result->status : "in progress");
-    }
+    /*
+     * Report on every poll rather than once. On a terminal that rewrites one
+     * line, so it shows movement rather than accumulating; redirected, the
+     * reporter throttles itself.
+     */
+    sfcc_progress_report(&prog, "retrieve", result->id, result->status,
+                         (long)(time(NULL) - start), o.timeout_s,
+                         o.poll_interval_s);
   }
+
+  /* Clear the in-place line before anything else is printed. */
+  sfcc_progress_finish(&prog);
   sfcc_buf_free(&endpoint);
 
   /*

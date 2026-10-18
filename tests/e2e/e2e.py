@@ -301,7 +301,20 @@ def test_retrieve(c, r):
                 "got %r" % got[:80])
 
     r.section("retrieve: it polls rather than assuming the first answer is final")
-    r.contains(se, "Pending", "the first status was Pending, so it polled again")
+    # The progress line reports the most recent status, so after a completed
+    # retrieve it reads Succeeded. What proves polling happened is the exchange
+    # count below; this checks the line a person watching actually sees.
+    r.contains(se, "retrieve", "progress names the operation")
+    r.contains(se, "elapsed,", "and shows elapsed time")
+    r.contains(se, "left of", "and how much of the budget is left")
+    m = re.search(r"(\d+)s elapsed, (\d+)s left of (\d+)s", se)
+    r.check(m is not None, "the counts are three integers",
+            repr(se[-200:]))
+    if m:
+        elapsed, left, budget = (int(g) for g in m.groups())
+        r.check(budget > 0 and left <= budget and elapsed <= budget,
+                "and they are consistent with each other",
+                "elapsed=%d left=%d budget=%d" % (elapsed, left, budget))
     # Only the POST has a body, so the request log is where the exchanges are
     # counted -- SOAP_BODIES would only ever show the one that was sent a body.
     soap_calls = [q for q in MOCK.requests[before:] if q[1].startswith("/services/Soap/")]
@@ -341,9 +354,11 @@ def test_retrieve(c, r):
     # -- which surfaced as <unpackaged> being reported invalid. A retrieve that
     # completes is therefore the proof, and it is asserted above; this pins the
     # reason so the connection is not accidental.
-    r.contains(se, "Pending",
-               "the retrieve got past SOAPAction, which the mock rejects "
-               "unless empty")
+    # The mock faults any named SOAPAction, so a retrieve that completes at all
+    # is the proof. Stated here because the previous version of this assertion
+    # depended on a status string that the progress line no longer leaves last.
+    r.check("Unexpected SOAPAction" not in se,
+            "no named SOAPAction was rejected", repr(se[-200:]))
     r.section("retrieve: the URL carries the bare version, not the REST one")
     # A real org answers /services/Soap/m/v64.0 with "Invalid Api version
     # specified on URL". The envelope was already bare; the path was not, and a
@@ -353,6 +368,24 @@ def test_retrieve(c, r):
     r.check(all("/services/Soap/m/64.0" in q for q in paths),
             "the path is /services/Soap/m/64.0", repr(paths))
     r.lacks(" ".join(paths), "/m/v64.0", "and never the v-prefixed form")
+
+    r.section("retrieve: a slow retrieve reports more than once")
+    # Redirected, the progress lines are throttled by the reporter rather than
+    # rewritten, so a CI log gets a readable history instead of 180 identical
+    # lines. This needs a retrieve that stays Pending long enough to emit any.
+    path = c.write("package.xml",
+                   PACKAGE_XML.replace("ApexClass", "PollMany"))
+    rc, so, se = c.run("retrieve", path, "--out", c.path_in("slow.zip"),
+                       "--retrieve-poll-interval", "1")
+    r.check(rc == 0, "the slow retrieve still completes", se[-200:])
+    lines = [l for l in se.splitlines() if "elapsed," in l]
+    r.check(len(lines) >= 2,
+            "more than one progress line when stderr is redirected",
+            "%d lines: %r" % (len(lines), lines))
+    r.check(all(l.endswith("s") and "left of" in l for l in lines),
+            "each is a complete standalone line", repr(lines))
+    r.lacks(se, "\r",
+            "and there are no carriage returns when redirected")
 
     r.section("retrieve: a failed retrieve names the org's own reason")
     path = c.write("package.xml",

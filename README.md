@@ -249,6 +249,17 @@ sfcc deploy --zip build/metadata.zip
 | `--retrieve-poll-interval <s>` | Status poll interval (default 5) |
 | `--retrieve-timeout <s>` | Give up waiting after this long (default 900) |
 
+Both `retrieve` and `deploy` report while they wait, with the elapsed time and
+what is left of the budget:
+
+```
+  retrieve 0Af1B000000XXXX: Pending... 3s elapsed, 897s left of 900s
+```
+
+On a terminal that is one line rewritten in place, so it shows movement rather
+than filling the scrollback. Redirected — a CI log, a file — the same text is
+written as standalone lines, throttled to one per poll interval.
+
 **This is the one command that is not REST.** The Metadata API has a REST
 resource for deploy but not for retrieve — Salesforce's own CLI and jsforce both
 use SOAP for this, `performRetrieve` is documented as "Reserved for future use",
