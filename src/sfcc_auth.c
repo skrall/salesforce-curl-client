@@ -91,8 +91,20 @@ sfcc_status sfcc_auth_load_cache(sfcc_client* c){
       if(cJSON_IsString(ident) && ident->valuestring){
         sfcc_strset(&c->identity_url, ident->valuestring);
       }
-      if(cJSON_IsNumber(issued)){
-        c->token_expiry = (time_t)issued->valuedouble;
+      /*
+       * expires_at is written by sfcc_auth_save_cache. Older caches predate it
+       * and carry only issued_at, so the assumed TTL is applied here rather
+       * than trusting the raw issue time as if it were an expiry.
+       *
+       * That distinction was worth a whole bug: reading issued_at straight into
+       * token_expiry made every cached token older than the one-minute margin
+       * look expired, so the cache was honoured for sixty seconds and no longer.
+       */
+      const cJSON* expires = cJSON_GetObjectItemCaseSensitive(root, "expires_at");
+      if(cJSON_IsNumber(expires)){
+        c->token_expiry = (time_t)expires->valuedouble;
+      }else if(cJSON_IsNumber(issued)){
+        c->token_expiry = (time_t)issued->valuedouble + SFCC_TOKEN_TTL;
       }else{
         c->token_expiry = 0;   /* unknown age; treated as stale */
       }
@@ -130,7 +142,15 @@ void sfcc_auth_save_cache(sfcc_client* c){
   if(c->identity_url != NULL){
     cJSON_AddStringToObject(root, "identity_url", c->identity_url);
   }
-  cJSON_AddNumberToObject(root, "issued_at", (double)time(NULL));
+  const time_t now = time(NULL);
+  cJSON_AddNumberToObject(root, "issued_at", (double)now);
+  /*
+   * Written explicitly rather than left for the reader to infer. The TTL is an
+   * assumption -- the platform does not advertise a lifetime for this flow -- and
+   * putting the conclusion in the file makes that assumption visible to anyone
+   * reading it, instead of buried in the arithmetic on the load path.
+   */
+  cJSON_AddNumberToObject(root, "expires_at", (double)(now + SFCC_TOKEN_TTL));
 
   char* text = cJSON_PrintUnformatted(root);
   cJSON_Delete(root);
@@ -178,11 +198,50 @@ void sfcc_auth_save_cache(sfcc_client* c){
 /* Token request                                                            */
 /* ------------------------------------------------------------------------ */
 
-static void force_expired(sfcc_client* c){
+/*
+ * Salesforce's own code for a dead session. Shared, because three separate
+ * request paths meet the condition and each was previously deciding for itself.
+ */
+int sfcc_is_invalid_session(long status, const char* body){
+  return status == 401 ||
+         (body != NULL && strstr(body, "INVALID_SESSION_ID") != NULL) ||
+         (body != NULL && strstr(body, "SESSION expired") != NULL);
+}
+
+/*
+ * May this client replace a rejected token by authenticating again?
+ *
+ * Only when it holds the means to do so. The retry exists for a token *we*
+ * obtained and cached, which can go stale at any time. A token the caller
+ * supplied is none of our business: we cannot re-mint it, so discarding it and
+ * attempting a new grant would replace a precise "this token was rejected" with a
+ * vague "no credentials" and send the caller looking in the wrong place.
+ */
+static int can_reauthenticate(const sfcc_client* c){
+  return (c->client_id != NULL && c->client_secret != NULL);
+}
+
+/*
+ * Drop the token this client is holding, and the cache file holding the same
+ * one.
+ *
+ * Removing the file matters as much as clearing the fields. A cache that still
+ * names a token the server has rejected is read back on the next run, judged
+ * stale, and -- before this was separated out -- quietly handed straight back
+ * again, which is how an expired cache turned into a hard failure with no
+ * recovery attempt at all.
+ */
+void sfcc_auth_discard_token(sfcc_client* c){
+  if(c == NULL){
+    return;
+  }
   sfcc_strfree(&c->access_token);
   sfcc_strfree(&c->instance_url);
   sfcc_strfree(&c->identity_url);
   c->token_expiry = 0;
+  if(!c->no_cache && c->cache_path != NULL){
+    remove(c->cache_path);
+  }
 }
 
 sfcc_status sfcc_auth_fetch_token(sfcc_client* c){
@@ -190,7 +249,13 @@ sfcc_status sfcc_auth_fetch_token(sfcc_client* c){
     return SFCC_ERR_ARG;
   }
   /* Credentials supplied directly outrank the cache; they are how CI pins an
-   * externally-minted token to a specific user. */
+   * externally-minted token to a specific user.
+   *
+   * The invariant this guard depends on is that reaching here with a token
+   * already set means the *caller* set it. Every path that means "replace this
+   * token" therefore calls sfcc_auth_discard_token() first -- without that, this
+   * function cannot tell a rejected cache entry from a deliberate choice and
+   * returns the stale token it was asked to replace. */
   if(c->access_token != NULL && c->instance_url != NULL){
     return SFCC_OK;
   }
@@ -256,7 +321,7 @@ sfcc_status sfcc_auth_fetch_token(sfcc_client* c){
   if(!cJSON_IsString(tok) || !tok->valuestring ||
      !cJSON_IsString(inst) || !inst->valuestring){
     cJSON_Delete(root);
-    force_expired(c);
+    sfcc_auth_discard_token(c);
     return sfcc_fail(c, SFCC_ERR_AUTH,
                      "token response lacked access_token or instance_url; "
                      "check that the connected app has the Client Credentials "
@@ -273,11 +338,25 @@ sfcc_status sfcc_auth_fetch_token(sfcc_client* c){
   }
   cJSON_Delete(root);
   if(c->access_token == NULL || c->instance_url == NULL){
-    force_expired(c);
+    sfcc_auth_discard_token(c);
     return sfcc_fail(c, SFCC_ERR_MEM, "out of memory storing the token");
   }
 
   c->token_expiry = time(NULL) + SFCC_TOKEN_TTL;
   sfcc_auth_save_cache(c);
   return SFCC_OK;
+}
+
+sfcc_status sfcc_auth_reauthenticate(sfcc_client* c){
+  if(c == NULL){
+    return SFCC_ERR_ARG;
+  }
+  if(!can_reauthenticate(c)){
+    return sfcc_fail(c, SFCC_ERR_AUTH,
+                     "the access token was rejected and no "
+                     "SFCC_CLIENT_ID/SFCC_CLIENT_SECRET are set to obtain a "
+                     "replacement");
+  }
+  sfcc_auth_discard_token(c);
+  return sfcc_auth_fetch_token(c);
 }

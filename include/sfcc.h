@@ -147,6 +147,12 @@ void sfcc_client_free(sfcc_client* c);
  * credentials this may touch no network at all. Useful for `whoami` and for
  * confirming that credentials work before doing real work.
  */
+/* Whether c has any route to credentials: a token and instance supplied
+ * directly, a client-credentials pair, or a token cache on disk. Lets a caller
+ * explain the situation before the first request rather than after a confusing
+ * rejection from the org. */
+int sfcc_client_can_authenticate(const sfcc_client* c);
+
 sfcc_status sfcc_authenticate(sfcc_client* c, char** instance_url);
 
 /* ------------------------------------------------------------------------ */

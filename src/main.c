@@ -1429,41 +1429,53 @@ int main(int argc, char** argv){
   if(no_cache) cfg.no_cache = 1;
   cfg.insecure = insecure;
 
-  /* Give a clear message up front rather than a confusing 400 from the token
-   * endpoint, and never echo the secret itself. */
-  if(cfg.instance_url == NULL || cfg.access_token == NULL){
-    if(cfg.client_id == NULL || cfg.client_secret == NULL){
-      if(instance != NULL || token != NULL){
-        /* Exactly one of the two was supplied. Each is useless alone: the
-         * instance says which org, the token says you may act on it, and a
-         * request missing either is rejected in a way that reads like bad
-         * credentials. */
-        fprintf(stderr,
-          SFCC_PROGNAME ": --%s was given without --%s.\n"
-          "  Both are required together:\n"
-          "    --instance  org base URL, e.g. https://acme.my.salesforce.com\n"
-          "    --token     an access token for that org\n",
-          instance != NULL ? "instance" : "token",
-          instance != NULL ? "token" : "instance");
-        return 2;
-      }
-      fprintf(stderr,
-        SFCC_PROGNAME ": no credentials.\n"
-        "  Either set both of these and let the client authenticate:\n"
-        "    SFCC_CLIENT_ID      connected app consumer key\n"
-        "    SFCC_CLIENT_SECRET  connected app consumer secret\n"
-        "  Or supply an already-issued token directly:\n"
-        "    --instance https://acme.my.salesforce.com --token <access token>\n"
-        "  The secret is read from the environment only, never from an\n"
-        "  argument, because command lines are visible to other processes.\n");
-      return 2;
-    }
+  /* Exactly one of the two was supplied. Each is useless alone: the instance
+   * says which org, the token says you may act on it, and a request missing
+   * either is rejected in a way that reads like bad credentials. Checked before
+   * the client is built, because it needs nothing from it. */
+  if((instance != NULL) != (token != NULL)){
+    fprintf(stderr,
+      SFCC_PROGNAME ": --%s was given without --%s.\n"
+      "  Both are required together:\n"
+      "    --instance  org base URL, e.g. https://acme.my.salesforce.com\n"
+      "    --token     an access token for that org\n",
+      instance != NULL ? "instance" : "token",
+      token != NULL ? "token" : "instance");
+    return 2;
   }
 
   sfcc_client* c = sfcc_client_new(&cfg);
   if(c == NULL){
     fprintf(stderr, SFCC_PROGNAME ": out of memory\n");
     return 1;
+  }
+
+  /*
+   * A clear message up front rather than a confusing 400 from the token
+   * endpoint, and never echo the secret itself.
+   *
+   * A token cache counts as credentials. It did not before, which meant a run
+   * with nothing in the environment was refused before it ever looked -- even
+   * with a cache on disk that `sfcc auth` had written and that would have worked
+   * fine. The advice was "set SFCC_CLIENT_ID and SFCC_CLIENT_SECRET", which is a
+   * plausible thing to do and entirely beside the point; the actual answer was to
+   * stop unsetting them. The check sits after sfcc_client_new() because the cache
+   * path is resolved in there, so only the client knows where to look.
+   */
+  if(!sfcc_client_can_authenticate(c)){
+    fprintf(stderr,
+      SFCC_PROGNAME ": no credentials.\n"
+      "  Either set both of these and let the client authenticate:\n"
+      "    SFCC_CLIENT_ID      connected app consumer key\n"
+      "    SFCC_CLIENT_SECRET  connected app consumer secret\n"
+      "  Or supply an already-issued token directly:\n"
+      "    --instance https://acme.my.salesforce.com --token <access token>\n"
+      "  A token cache at %s would serve too, if it is still current.\n"
+      "  The secret is read from the environment only, never from an\n"
+      "  argument, because command lines are visible to other processes.\n",
+      c->cache_path ? c->cache_path : "(none)");
+    sfcc_client_free(c);
+    return 2;
   }
 
   int rc = 0;
