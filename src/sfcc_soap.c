@@ -33,6 +33,10 @@
 #include <string.h>
 #include <time.h>
 
+#if defined(_WIN32)
+#include <windows.h>     /* Sleep, DWORD */
+#endif
+
 #define SFCC_RETRIEVE_POLL_DEFAULT 5L
 #define SFCC_RETRIEVE_TIMEOUT_DEFAULT 900L   /* 15 minutes */
 
