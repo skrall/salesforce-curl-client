@@ -122,6 +122,9 @@ const char* sfcc_home_dir(void);
  * directory cannot be determined. */
 const char* sfcc_default_cache_path(void);
 
+/* Whether a readable file exists at `path`. */
+int sfcc_file_readable(const char* path);
+
 /* ------------------------------------------------------------------------ */
 /* HTTP                                                                     */
 /* ------------------------------------------------------------------------ */
@@ -261,8 +264,24 @@ sfcc_status sfcc_fail(sfcc_client* c, sfcc_status rc, const char* fmt, ...)
 int sfcc_token_is_fresh(const sfcc_client* c);
 
 /* OAuth client-credentials grant, then populate instance_url/access_token and
- * the cache. */
+ * the cache. Returns immediately when the client already holds a token, so
+ * callers that mean to replace one must discard it first. */
 sfcc_status sfcc_auth_fetch_token(sfcc_client* c);
+
+/* Drop the held token and delete the cache file naming the same one. */
+void sfcc_auth_discard_token(sfcc_client* c);
+
+/* Replace a token the server has rejected with a freshly minted one: discard,
+ * then grant. Fails with SFCC_ERR_AUTH when the client holds no credentials to
+ * mint with, since a caller-supplied token is not ours to renew.
+ *
+ * Shared by every request path, because every one of them meets a dead session
+ * and a dead token is not a reason for one transport to give up and another to
+ * carry on. */
+sfcc_status sfcc_auth_reauthenticate(sfcc_client* c);
+
+/* Salesforce's own code for a dead session, across REST and SOAP. */
+int sfcc_is_invalid_session(long status, const char* body);
 
 /* Load a cached token if one exists and is still fresh. */
 sfcc_status sfcc_auth_load_cache(sfcc_client* c);

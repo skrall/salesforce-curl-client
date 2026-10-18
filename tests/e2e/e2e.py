@@ -19,6 +19,7 @@ installed (stdlib only), and needs no Salesforce org or credentials.
 Exit status is 0 when everything passed and 1 otherwise.
 """
 
+import json
 import os
 import re
 import shutil
@@ -26,10 +27,11 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from mock_server import (BLOB, MOCK_CLIENT_ID, MOCK_SECRET, MockSalesforce,
-                         RETRIEVE_ZIP, STATE)
+from mock_server import (BLOB, EXPIRED_TOKEN, MOCK_CLIENT_ID, MOCK_SECRET,
+                         MOCK_TOKEN, MockSalesforce, RETRIEVE_ZIP, STATE)
 
 # The SOAP envelopes the mock has received, read live: most of the
 # assertions here are about what the client sent, and the only way to see
@@ -191,6 +193,137 @@ def test_auth(c, r):
     r.contains(blob, "invalid_client", "reports invalid_client")
     r.contains(blob, "client identifier invalid", "reports the description")
     r.lacks(blob, '{"error"', "not printed as a raw json blob")
+
+
+def seed_cache(c, token, instance, expires_in):
+    """Write a token cache the client will find on startup.
+
+    expires_in is a number of seconds from now. Negative puts the expiry in the
+    past, which is how the tests say "this cache is dead" without having to wait
+    half an hour for the assumed TTL to elapse.
+    """
+    path = c.path_in("token.json")
+    with open(path, "w") as fh:
+        json.dump({"access_token": token, "instance_url": instance,
+                   "issued_at": time.time(),
+                   "expires_at": time.time() + expires_in}, fh)
+    return path
+
+
+def test_token_refresh(c, r):
+    r.section("token: an expired cache is replaced, not resent")
+
+    # The reported bug. A cache the client has itself judged dead was handed
+    # straight back to the org: the freshness check said "expired" and the
+    # function that should have minted a replacement returned the same token,
+    # because it could not tell a cache entry from credentials the caller
+    # supplied on purpose.
+    path = seed_cache(c, EXPIRED_TOKEN, c.login_url, -3600)
+    env = dict(c.env)
+    env["SFCC_TOKEN_CACHE"] = path
+    proc = subprocess.run([c.path, "--login-url", c.login_url, "rest", "echo"],
+                          capture_output=True, text=True, env=env,
+                          cwd=c.workdir, timeout=60)
+    r.check(proc.returncode == 0,
+            "the command succeeds against a dead cache",
+            proc.stderr.strip()[:200])
+    auth = MOCK.last_auth("echo")
+    r.check(auth is not None and EXPIRED_TOKEN not in auth,
+            "the expired token was never sent", repr(auth))
+    r.check(auth is not None and MOCK_TOKEN in auth,
+            "a freshly minted one was", repr(auth))
+    with open(path) as fh:
+        r.check(MOCK_TOKEN in fh.read(),
+                "and the cache on disk was rewritten")
+
+    r.section("token: a cache inside its lifetime is reused")
+    # The other half. Without this the fix could pass by minting a new token on
+    # every single run, which is correct but defeats the point of a cache.
+    path = seed_cache(c, MOCK_TOKEN, c.login_url, 1800)
+    before = MOCK.token_grants
+    env = dict(c.env)
+    env["SFCC_TOKEN_CACHE"] = path
+    proc = subprocess.run([c.path, "--login-url", c.login_url, "rest", "echo"],
+                          capture_output=True, text=True, env=env,
+                          cwd=c.workdir, timeout=60)
+    r.check(proc.returncode == 0, "the command succeeds", proc.stderr[:200])
+    r.check(MOCK.token_grants == before,
+            "and no new grant was requested",
+            "%d -> %d" % (before, MOCK.token_grants))
+
+    r.section("token: a cache with no expiry at all is not trusted")
+    # Older caches predate expires_at. issued_at alone has to be read with the
+    # TTL applied rather than as though it were the expiry itself.
+    path = c.path_in("token.json")
+    with open(path, "w") as fh:
+        json.dump({"access_token": EXPIRED_TOKEN, "instance_url": c.login_url,
+                   "issued_at": time.time() - 3600}, fh)
+    env["SFCC_TOKEN_CACHE"] = path
+    proc = subprocess.run([c.path, "--login-url", c.login_url, "rest", "echo"],
+                          capture_output=True, text=True, env=env,
+                          cwd=c.workdir, timeout=60)
+    r.check(proc.returncode == 0, "the command succeeds", proc.stderr[:200])
+    auth = MOCK.last_auth("echo")
+    r.check(auth is not None and EXPIRED_TOKEN not in auth,
+            "and the stale token is not resent", repr(auth))
+
+    r.section("token: retrieve recovers, where it used to fail outright")
+    # The asymmetry that made this look like a retrieve problem rather than an
+    # auth problem. REST retried on a dead session; SOAP had no retry at all, so
+    # the same dead token failed retrieve and succeeded query.
+    path = seed_cache(c, EXPIRED_TOKEN, c.login_url, -3600)
+    env = dict(c.env)
+    env["SFCC_TOKEN_CACHE"] = path
+    out = c.path_in("refreshed.zip")
+    proc = subprocess.run(
+        [c.path, "--login-url", c.login_url, "retrieve",
+         c.write("package.xml", PACKAGE_XML), "--out", out],
+        capture_output=True, text=True, env=env, cwd=c.workdir, timeout=120)
+    r.check(proc.returncode == 0, "retrieve succeeds",
+            proc.stderr.strip()[:200])
+    r.check(os.path.exists(out), "and writes the archive")
+
+    r.section("token: a session rejected mid-flight is retried once")
+    # The harder case: the cache looks perfectly fresh, so the client trusts it
+    # and only the org can say otherwise. Both the URL and the envelope have to
+    # be rebuilt against the new token -- reusing the old envelope would send the
+    # session id that had just been rejected and fail again, in a way that looks
+    # like a bug rather than a retry.
+    path = seed_cache(c, EXPIRED_TOKEN, c.login_url, 1800)
+    env = dict(c.env)
+    env["SFCC_TOKEN_CACHE"] = path
+    out = c.path_in("revoked.zip")
+    proc = subprocess.run(
+        [c.path, "--login-url", c.login_url, "retrieve",
+         c.write("package.xml", PACKAGE_XML), "--out", out],
+        capture_output=True, text=True, env=env, cwd=c.workdir, timeout=120)
+    r.check(proc.returncode == 0, "retrieve succeeds after being re-authed",
+            proc.stderr.strip()[:200])
+    r.check(os.path.exists(out), "and writes the archive")
+    r.check(MOCK.soap_dead_session >= 1,
+            "the org really did report a dead session first",
+            "count=%d" % MOCK.soap_dead_session)
+    bodies = SOAP_BODIES
+    r.check(any(MOCK_TOKEN in b for b in bodies),
+            "the envelope that succeeded carried the new session id")
+    r.check(not any(EXPIRED_TOKEN in b for b in bodies[-1:]),
+            "and the last envelope did not carry the rejected one")
+
+    r.section("token: a rejected token with no credentials is reported plainly")
+    # Refusing to retry without the means to re-mint is deliberate. Replacing a
+    # precise "this token was rejected" with a vague "no credentials" sends the
+    # caller looking in the wrong place.
+    env = {k: v for k, v in c.env.items()
+           if k not in ("SFCC_CLIENT_ID", "SFCC_CLIENT_SECRET")}
+    env["SFCC_TOKEN_CACHE"] = seed_cache(c, EXPIRED_TOKEN, c.login_url, 1800)
+    proc = subprocess.run([c.path, "--login-url", c.login_url, "rest", "echo"],
+                          capture_output=True, text=True, env=env,
+                          cwd=c.workdir, timeout=60)
+    blob = proc.stdout + proc.stderr
+    r.check(proc.returncode != 0, "exits nonzero")
+    r.contains(blob, "INVALID_SESSION_ID", "and names the org's reason")
+    r.lacks(blob, "no credentials",
+            "rather than pretending the credentials are missing")
 
 
 def test_query(c, r):
@@ -940,7 +1073,7 @@ def test_transport_errors(c, r):
 
 # --------------------------------------------------------------------------
 
-ALL = [test_auth, test_query, test_sobjects, test_describe, test_retrieve,
+ALL = [test_auth, test_token_refresh, test_query, test_sobjects, test_describe, test_retrieve,
        test_records,
        test_validation, test_rest,
        test_binary_output, test_stdio, test_deploy, test_transport_errors]

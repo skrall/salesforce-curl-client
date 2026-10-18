@@ -33,6 +33,13 @@ VERSION = "v64.0"
 
 # A recognisable token, so a test can assert *which* token was sent.
 MOCK_TOKEN = "00Dxx0000000001!AQEAQFmocktokenvalue=="
+
+# A token the mock refuses, standing in for one the org has stopped honouring.
+#
+# The mock used to accept any bearer token, which is the same mistake in reverse
+# as the SOAP mock that certified three broken request bodies: a mock that never
+# rejects a bad credential cannot demonstrate that the client recovers from one.
+EXPIRED_TOKEN = "00Dxx0000000001!AQEAQFexpired======"
 MOCK_SECRET = "test-secret"
 MOCK_CLIENT_ID = "test-consumer-key"
 
@@ -200,6 +207,8 @@ class _State:
         self.soap_bodies = []
         self.soap_polls = {}    # retrieve id -> number of checkStatus calls
         self.soap_slow = {}     # retrieve id -> how many Pending rounds
+        self.soap_dead_session = 0  # times SOAP was told the session is dead
+        self.token_grants = 0     # OAuth grants actually requested
         self.lock = threading.Lock()
 
     def record(self, method, path, auth, ctype):
@@ -472,6 +481,27 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return False
 
+    def _expired(self):
+        """Is this request presenting the token the mock refuses?"""
+        return EXPIRED_TOKEN in (self.headers.get("Authorization") or "")
+
+    def _dead_session(self):
+        """Answer as the org answers a dead session, then report having done so.
+
+        The shape depends on the transport, and the difference is the point: over
+        REST a dead session is a 401, and over SOAP it arrives as a fault inside
+        a 500. A client that only looks at the status code recovers from one and
+        not the other.
+        """
+        if self._soap():
+            with STATE.lock:
+                STATE.soap_dead_session += 1
+            return self._soap_fault(
+                "sf:INVALID_SESSION_ID",
+                "Invalid Session ID found in SessionHeader: expired or invalid")
+        return self._send_salesforce_error(
+            401, "Session expired or invalid", "INVALID_SESSION_ID")
+
     def _soap(self):
         """True when this is a Metadata SOAP endpoint, whatever the operation.
 
@@ -505,6 +535,8 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         self._note()
+        if self._expired():
+            return self._dead_session()
         if self._deploy_status():
             return
         u = urlparse(self.path)
@@ -647,6 +679,8 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._note()
         raw = self._body()
+        if self._expired():
+            return self._dead_session()
         u = urlparse(self.path)
 
         # A bodyless POST to the SOAP endpoint is checkRetrieveStatus. Every SOAP
@@ -713,6 +747,8 @@ class Handler(BaseHTTPRequestHandler):
                 200, (RETRIEVE_PENDING_SOAP % rid).encode("utf-8"), "text/xml")
 
         if u.path == "/services/oauth2/token":
+            with STATE.lock:
+                STATE.token_grants += 1
             # The assertion that matters most: this endpoint must be form
             # encoded. A JSON content-type here would be a silent bug, because
             # the client sends JSON for every other call in the project.

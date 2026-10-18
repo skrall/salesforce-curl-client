@@ -509,10 +509,19 @@ deliberately. Each is covered by a test.
   messages are often captured into logs and CI annotations.
 
 * **A cached token can go stale at any moment.** Salesforce does not say when
-  an access token expires, and one can be revoked server-side between runs. On
-  `INVALID_SESSION_ID` the client drops the cached token, fetches a new one,
-  and retries exactly once. Without that, long-running scripts need a manual
-  `rm ~/.sfcc-token.json`.
+  an access token expires, and one can be revoked server-side between runs. The
+  cache records an `expires_at` when the token is written, and a cache that has
+  passed it is discarded and replaced before the request goes out — so an expired
+  cache is not something you have to notice. If the org rejects a token that
+  looked current anyway, the client drops it, fetches a new one, and retries
+  exactly once, over REST and SOAP alike. Without either, long-running scripts
+  need a manual `rm ~/.sfcc-token.json`.
+
+* **A token cache counts as credentials.** A run with `SFCC_CLIENT_ID` and
+  `SFCC_CLIENT_SECRET` unset is not refused for having none while a current cache
+  is sitting on disk. Previously it was, and the advice it gave — set the two
+  environment variables — was a plausible thing to do and entirely beside the
+  point. The failure message names the cache path it looked at.
 
 * **The token cache is created mode 0600.** It holds a bearer token granting
   whatever the integration user can do. Created normally it lands at 0644,

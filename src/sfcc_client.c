@@ -297,7 +297,36 @@ sfcc_status sfcc_ensure_auth(sfcc_client* c){
   if(sfcc_token_is_fresh(c)){
     return SFCC_OK;
   }
+  /*
+   * The cache handed us a token we have just judged unusable. Drop it before
+   * asking for a replacement: sfcc_auth_fetch_token treats a populated token as
+   * caller-supplied credentials and returns it untouched, so without this the
+   * answer to "your cached token is expired" was the expired token itself.
+   */
+  sfcc_auth_discard_token(c);
   return sfcc_auth_fetch_token(c);
+}
+
+/*
+ * Does this client have any way to obtain credentials?
+ *
+ * Three sources, and all three count. The cache is the one that was forgotten:
+ * a run with the credentials unset was reported as having none, while a token
+ * from an earlier `sfcc auth` sat on disk ready to be used. Whether that token is
+ * still current is a separate question the client answers properly when it reads
+ * it -- this only asks whether there is anything to read.
+ */
+int sfcc_client_can_authenticate(const sfcc_client* c){
+  if(c == NULL){
+    return 0;
+  }
+  if(c->access_token != NULL && c->instance_url != NULL){
+    return 1;   /* supplied directly */
+  }
+  if(c->client_id != NULL && c->client_secret != NULL){
+    return 1;   /* can mint one */
+  }
+  return sfcc_file_readable(c->cache_path);
 }
 
 sfcc_status sfcc_authenticate(sfcc_client* c, char** instance_url){
@@ -321,28 +350,6 @@ sfcc_status sfcc_authenticate(sfcc_client* c, char** instance_url){
 /* ------------------------------------------------------------------------ */
 /* The single request path                                                  */
 /* ------------------------------------------------------------------------ */
-
-/* Salesforce's own code for a dead session. Used to decide whether a failure
- * is worth retrying once with a fresh token. */
-static int is_invalid_session(long status, const char* body){
-  return status == 401 ||
-         (body != NULL && strstr(body, "INVALID_SESSION_ID") != NULL) ||
-         (body != NULL && strstr(body, "SESSION expired") != NULL);
-}
-
-/*
- * May this client replace a rejected token by authenticating again?
- *
- * Only when it holds the means to do so. The retry exists for a token *we*
- * obtained and cached, which can go stale at any time. A token the caller
- * supplied with --token is none of our business: we cannot re-mint it, so
- * discarding it and attempting a new grant would replace a precise "this token
- * was rejected" with a vague "no credentials" and send the caller looking in
- * the wrong place entirely.
- */
-static int can_reauthenticate(const sfcc_client* c){
-  return (c->client_id != NULL && c->client_secret != NULL);
-}
 
 static sfcc_status api_call(sfcc_client* c, sfcc_method method,
                             const char* path, const char* json_body,
@@ -379,19 +386,10 @@ static sfcc_status api_call(sfcc_client* c, sfcc_method method,
       free(url);
       return sfcc_finish(c, &resp, out);
     }
-    if(attempt == 0 && is_invalid_session(resp.status, resp.body.data) &&
-       can_reauthenticate(c)){
+    if(attempt == 0 && sfcc_is_invalid_session(resp.status, resp.body.data) &&
+       c->client_id != NULL && c->client_secret != NULL){
       sfcc_response_free(&resp);
-      /* Invalidate locally and force a fresh token, whatever the cache says.
-       * The identity URL belongs to the old token, so it goes too. */
-      sfcc_strfree(&c->access_token);
-      sfcc_strfree(&c->instance_url);
-      sfcc_strfree(&c->identity_url);
-      c->token_expiry = 0;
-      if(!c->no_cache && c->cache_path != NULL){
-        remove(c->cache_path);
-      }
-      rc = sfcc_auth_fetch_token(c);
+      rc = sfcc_auth_reauthenticate(c);
       if(rc != SFCC_OK){
         free(url);
         return rc;

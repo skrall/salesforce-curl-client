@@ -35,10 +35,33 @@ set_tests_properties(cli_missing_value PROPERTIES WILL_FAIL TRUE)
 # With no credentials in the environment, the tool must say so and exit 2
 # rather than attempting a request. The environment is cleared so the developer's
 # own exported variables cannot make this pass or fail by accident.
-add_test(NAME cli_no_credentials COMMAND sfcc_cli auth)
+#
+# SFCC_TOKEN_CACHE is pointed at a path under the build directory that nothing
+# creates. Clearing only the environment variables was not enough: the token cache
+# is a third source of credentials, so this test used to pass or fail depending on
+# whether the machine running it had ever run `sfcc auth`. It failed that way here,
+# after a debugging session left a real ~/.sfcc-token.json behind.
+add_test(NAME cli_no_credentials
+  COMMAND sfcc_cli auth --token-cache "${CMAKE_CURRENT_BINARY_DIR}/nonexistent-token.json")
 set_tests_properties(cli_no_credentials PROPERTIES
   WILL_FAIL TRUE
   ENVIRONMENT "SFCC_CLIENT_ID=;SFCC_CLIENT_SECRET=;SFCC_ACCESS_TOKEN=;SFCC_INSTANCE_URL=")
+
+# The converse, and the reason the cache is consulted at all: a cache on disk is
+# credentials, so the client must get past the gate and fail on the network instead
+# of claiming it has none. Without this the gate could be tightened back to
+# "credentials in the environment only" and every test here would still pass.
+add_test(NAME cli_cache_counts_as_credentials
+  COMMAND sfcc_cli auth --login-url "http://127.0.0.1:1"
+          --token-cache "${CMAKE_CURRENT_BINARY_DIR}/token.json")
+set_tests_properties(cli_cache_counts_as_credentials PROPERTIES
+  ENVIRONMENT "SFCC_CLIENT_ID=;SFCC_CLIENT_SECRET=;SFCC_ACCESS_TOKEN=;SFCC_INSTANCE_URL="
+  # Reports the org it is talking to, which only happens once the gate has let it
+  # through, and never claims the credentials are missing.
+  PASS_REGULAR_EXPRESSION "instance: http://127.0.0.1:1"
+  FAIL_REGULAR_EXPRESSION "no credentials")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/token.json"
+  "{\"access_token\":\"t\",\"instance_url\":\"http://127.0.0.1:1\",\"expires_at\":99999999999}")
 
 # A malformed record id must be rejected before any network call. This is the
 # check that keeps a bad argument from becoming a confusing 404.

@@ -620,11 +620,73 @@ static sfcc_status write_file(const char* path, const char* data, size_t n){
 /* ------------------------------------------------------------------------ */
 
 /*
- * One SOAP exchange. GET carries no body; SOAPAction names the operation.
+ * Build "<instance><path>" from the token's own instance_url.
+ *
+ * Built here rather than passed in by the caller so that a re-authentication
+ * mid-call is reflected in the URL. A fresh token can name a different org than
+ * the expired one did, and retrying against the old instance_url would produce a
+ * 404 that looks nothing like the session error that caused the retry. This is
+ * the same arrangement api_call() uses for the REST paths.
  */
+static char* soap_url(const sfcc_client* c, const char* path){
+  sfcc_buf b;
+  sfcc_buf_init(&b);
+  sfcc_buf_puts(&b, c->instance_url ? c->instance_url : "");
+  sfcc_buf_puts(&b, path);
+  char* url = sfcc_strdup(b.data ? b.data : "");
+  sfcc_buf_free(&b);
+  return url;
+}
+
+/*
+ * Produce the request body for one attempt.
+ *
+ * A callback rather than a string because the envelope carries the session id.
+ * Any retry mints a new token, so a body built once up front would go back out
+ * still naming the session that had just been rejected -- and a stale session id
+ * in an otherwise valid envelope produces a second failure that looks like a
+ * bug rather than a retry.
+ */
+typedef void (*sfcc_soap_body_fn)(const sfcc_client* c, const void* ctx,
+                                  sfcc_buf* out);
+
+/*
+ * One SOAP exchange, with one retry if the org says the session is dead.
+ *
+ * The retry is what the SOAP path was missing. REST had it and SOAP did not, so a
+ * token that went stale between the cache being read and the request being sent
+ * failed every retrieve outright while every query recovered silently -- the same
+ * token, the same org, two different behaviours. That asymmetry is the whole
+ * reason this reads as a bug worth fixing rather than an optimisation.
+ *
+ * One retry only. A second rejection means the credentials are wrong, and looping
+ * would just make a clear error arrive slower.
+ */
+/* ctx for make_retrieve_body: the spliced <unpackaged> from the manifest. */
+typedef struct {
+  const char* unpackaged;
+} retrieve_ctx;
+
+/* ctx for make_check_body: the asyncProcessId returned by the request. */
+typedef struct {
+  const char* id;
+} check_ctx;
+
+static void make_retrieve_body(const sfcc_client* c, const void* ctx,
+                               sfcc_buf* out){
+  const retrieve_ctx* r = (const retrieve_ctx*)ctx;
+  build_envelope(c->api_version, c->access_token, r->unpackaged, out);
+}
+
+static void make_check_body(const sfcc_client* c, const void* ctx, sfcc_buf* out){
+  const check_ctx* cc = (const check_ctx*)ctx;
+  build_check_envelope(c->access_token, cc->id ? cc->id : "", out);
+}
+
 static sfcc_status soap_call(sfcc_client* c, sfcc_method method,
-                             const char* url, const char* action,
-                             const char* body, sfcc_buf* out){
+                             const char* path, const char* action,
+                             sfcc_soap_body_fn make_body, const void* ctx,
+                             sfcc_buf* out){
   /*
    * Exactly "text/xml", with no charset parameter, on every call.
    *
@@ -643,15 +705,56 @@ static sfcc_status soap_call(sfcc_client* c, sfcc_method method,
    * the same expression.
    */
   const char* headers[] = { action, "Content-Type: text/xml", NULL };
-  sfcc_response resp;
-  const sfcc_status rc = sfcc_http_request_ex(
-      c, method, url, c->access_token, body, NULL, headers, &resp);
-  if(rc != SFCC_OK){
-    return rc;
-  }
-  c->last_status = resp.status;
 
-  if(resp.status < 200 || resp.status >= 300){
+  for(int attempt = 0 ; attempt < 2 ; ++attempt){
+    char* url = soap_url(c, path);
+    if(url == NULL){
+      return sfcc_fail(c, SFCC_ERR_MEM, "out of memory building the SOAP URL");
+    }
+
+    sfcc_buf body;
+    sfcc_buf_init(&body);
+    make_body(c, ctx, &body);
+
+    sfcc_response resp;
+    const sfcc_status rc = sfcc_http_request_ex(
+        c, method, url, c->access_token, body.data, NULL, headers, &resp);
+    sfcc_buf_free(&body);
+    free(url);
+    if(rc != SFCC_OK){
+      return rc;
+    }
+    c->last_status = resp.status;
+
+    if(resp.status >= 200 && resp.status < 300){
+      if(out != NULL){
+        /* The caller keeps the body: polling needs the final document to still
+         * be there after the response has been released. */
+        sfcc_buf_init(out);
+        if(resp.body.data != NULL && resp.body.len > 0){
+          sfcc_buf_append(out, resp.body.data, resp.body.len);
+        }
+      }
+      sfcc_response_free(&resp);
+      return SFCC_OK;
+    }
+
+    /* A SOAP fault for a dead session arrives as INVALID_SESSION_ID inside a
+     * 500, not as a 401, so the shared test has to read the body as well as the
+     * status. */
+    if(attempt == 0 && sfcc_is_invalid_session(resp.status, resp.body.data) &&
+       c->client_id != NULL && c->client_secret != NULL){
+      sfcc_response_free(&resp);
+      const sfcc_status auth = sfcc_auth_reauthenticate(c);
+      if(auth != SFCC_OK){
+        return auth;
+      }
+      /* Both the URL and the body are rebuilt on the next pass: the new token
+       * can name a different org, and its session id is the one that has to
+       * travel in the envelope. */
+      continue;
+    }
+
     char detail[SFCC_ERRLEN_MAX];
     describe_fault(resp.body.data ? resp.body.data : "", detail, sizeof(detail));
     sfcc_response_free(&resp);
@@ -659,16 +762,12 @@ static sfcc_status soap_call(sfcc_client* c, sfcc_method method,
                      ? SFCC_ERR_AUTH : SFCC_ERR_HTTP, "%s", detail);
   }
 
-  if(out != NULL){
-    /* The caller keeps the body: polling needs the final document to still be
-     * there after the response has been released. */
-    sfcc_buf_init(out);
-    if(resp.body.data != NULL && resp.body.len > 0){
-      sfcc_buf_append(out, resp.body.data, resp.body.len);
-    }
-  }
-  sfcc_response_free(&resp);
-  return SFCC_OK;
+  /* The loop returns on its last attempt, so this is unreachable. Returning a
+   * real error rather than SFCC_OK keeps that a compiler-checked claim instead of
+   * a comment: if a future edit added a third attempt, the fallthrough would be
+   * visible here rather than silently reporting success. */
+  return sfcc_fail(c, SFCC_ERR_AUTH,
+                   "the org rejected the session after re-authenticating");
 }
 
 sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
@@ -715,28 +814,30 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
     return rc;
   }
 
-  sfcc_buf envelope;
-  sfcc_buf_init(&envelope);
-  build_envelope(c->api_version, c->access_token, unpacked.data, &envelope);
-  sfcc_buf_free(&unpacked);
-
-  /* Bare version in the path, not the REST "v64.0" spelling: the endpoint is
+  /*
+   * Bare version in the path, not the REST "v64.0" spelling: the endpoint is
    * /services/Soap/m/64.0 and a real org answers the prefixed form with
    *   soapenv:Client: Invalid Api version specified on URL : /m/v64.0
-   * The envelope needs the same treatment and gets it from bare_version(). */
-  sfcc_buf endpoint;
-  sfcc_buf_init(&endpoint);
-  sfcc_buf_puts(&endpoint, c->instance_url);
-  sfcc_buf_puts(&endpoint, "/services/Soap/m/");
-  sfcc_buf_puts(&endpoint, bare_version(c->api_version));
+   * The envelope needs the same treatment and gets it from bare_version().
+   *
+   * Held as a path rather than a whole URL so soap_call can resolve it against
+   * the token's own instance_url on each attempt, which is what makes a
+   * re-authentication land on the right org.
+   */
+  sfcc_buf path;
+  sfcc_buf_init(&path);
+  sfcc_buf_puts(&path, "/services/Soap/m/");
+  sfcc_buf_puts(&path, bare_version(c->api_version));
+
+  const retrieve_ctx rctx = { unpacked.data };
 
   sfcc_buf doc;
   sfcc_buf_init(&doc);
-  rc = soap_call(c, SFCC_HTTP_POST, endpoint.data, SOAPACTION_EMPTY,
-                 envelope.data, &doc);
-  sfcc_buf_free(&envelope);
+  rc = soap_call(c, SFCC_HTTP_POST, path.data, SOAPACTION_EMPTY,
+                 make_retrieve_body, &rctx, &doc);
+  sfcc_buf_free(&unpacked);
   if(rc != SFCC_OK){
-    sfcc_buf_free(&endpoint);
+    sfcc_buf_free(&path);
     sfcc_buf_free(&doc);
     return rc;
   }
@@ -752,7 +853,7 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
 
   if(result->id == NULL){
     sfcc_buf_free(&doc);
-    sfcc_buf_free(&endpoint);
+    sfcc_buf_free(&path);
     sfcc_retrieve_result_free(result);
     return sfcc_fail(c, SFCC_ERR_HTTP,
                      "the org accepted the request but returned no id");
@@ -767,7 +868,7 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
   while(!result->done){
     if(time(NULL) - start >= o.timeout_s){
       const char* id = result->id;
-      sfcc_buf_free(&endpoint);
+      sfcc_buf_free(&path);
       sfcc_retrieve_result_free(result);
       return sfcc_fail(c, SFCC_ERR_NET,
                        "gave up waiting after %lds; the retrieve may still be "
@@ -793,15 +894,11 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
      * The poll used to be a GET, carried over from the REST deployStatus
      * pattern, where a GET is exactly right.
      */
-    sfcc_buf check_env;
-    sfcc_buf_init(&check_env);
-    build_check_envelope(c->access_token, result->id ? result->id : "",
-                         &check_env);
-    rc = soap_call(c, SFCC_HTTP_POST, endpoint.data, SOAPACTION_EMPTY,
-                   check_env.data, &doc);
-    sfcc_buf_free(&check_env);
+    const check_ctx cctx = { result->id };
+    rc = soap_call(c, SFCC_HTTP_POST, path.data, SOAPACTION_EMPTY,
+                   make_check_body, &cctx, &doc);
     if(rc != SFCC_OK){
-      sfcc_buf_free(&endpoint);
+      sfcc_buf_free(&path);
       sfcc_retrieve_result_free(result);
       return rc;
     }
@@ -819,7 +916,7 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
 
   /* Clear the in-place line before anything else is printed. */
   sfcc_progress_finish(&prog);
-  sfcc_buf_free(&endpoint);
+  sfcc_buf_free(&path);
 
   /*
    * Retrieve is a successful call that can describe a failure, so this checks

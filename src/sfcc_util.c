@@ -294,6 +294,25 @@ const char* sfcc_home_dir(void){
 #endif
 }
 
+/*
+ * Is there a readable file at this path?
+ *
+ * fopen rather than access()/stat(): one call, no platform split, and it answers
+ * the question actually being asked -- can this be read -- rather than whether it
+ * happens to exist.
+ */
+int sfcc_file_readable(const char* path){
+  if(path == NULL || *path == '\0'){
+    return 0;
+  }
+  FILE* f = fopen(path, "rb");
+  if(f == NULL){
+    return 0;
+  }
+  fclose(f);
+  return 1;
+}
+
 const char* sfcc_default_cache_path(void){
   const char* home = sfcc_home_dir();
   if(home == NULL){
