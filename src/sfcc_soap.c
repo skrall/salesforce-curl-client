@@ -206,6 +206,64 @@ static const char* bare_version(const char* v){
   return (v[0] == 'v' && v[1] != '\0') ? v + 1 : v;
 }
 
+/* The envelope head, shared by both operations. */
+static void envelope_head(sfcc_buf* out, const char* session_id){
+  sfcc_buf_puts(out,
+    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+    "<env:Envelope xmlns:env=\"http://schemas.xmlsoap.org/soap/envelope/\"\n"
+    "              xmlns=\"http://soap.sforce.com/2006/04/metadata\">\n"
+    "  <env:Header>\n"
+    "    <SessionHeader>\n"
+    "      <sessionId>");
+  /*
+   * A session id is an opaque Salesforce-generated string, so it is not markup
+   * in practice. It is still escaped rather than trusted: putting a credential
+   * into an XML document unsanitised is the one way it could become an injection
+   * point, and the cost of not assuming is a few hundred bytes.
+   */
+  sfcc_buf_append_xml(out, session_id);
+  sfcc_buf_puts(out,
+    "</sessionId>\n"
+    "    </SessionHeader>\n"
+    "  </env:Header>\n"
+    "  <env:Body>\n");
+}
+
+static void envelope_foot(sfcc_buf* out){
+  sfcc_buf_puts(out,
+    "  </env:Body>\n"
+    "</env:Envelope>\n");
+}
+
+/*
+ * checkRetrieveStatus, whose body must not be empty.
+ *
+ * Posting nothing gave "soapenv:Client: Premature end of file": the poll needs a
+ * real envelope, not just the right method and content type. The WSDL:
+ *
+ *   <xsd:element name="checkRetrieveStatus">
+ *     <xsd:sequence>
+ *       <asyncProcessId type="tns:ID"/>       required
+ *       <includeZip     type="xsd:boolean"/>  required
+ *
+ * Note the asymmetry with retrieve, which nests a single <retrieveRequest>
+ * element; here the fields sit directly in the operation. Both are required, so
+ * includeZip is sent true -- which is what asks for the archive rather than only
+ * the status. There is no apiVersion in this request at all, which is why this
+ * builder takes no version.
+ */
+static void build_check_envelope(const char* session_id, const char* async_id,
+                                 sfcc_buf* out){
+  envelope_head(out, session_id);
+  sfcc_buf_puts(out, "    <checkRetrieveStatus>\n      <asyncProcessId>");
+  sfcc_buf_append_xml(out, async_id);
+  sfcc_buf_puts(out,
+    "</asyncProcessId>\n"
+    "      <includeZip>true</includeZip>\n"
+    "    </checkRetrieveStatus>\n");
+  envelope_foot(out);
+}
+
 static void build_envelope(const char* api_version, const char* session_id,
                            const char* unpackaged, sfcc_buf* out){
   const char* bare = bare_version(api_version);
@@ -237,25 +295,8 @@ static void build_envelope(const char* api_version, const char* session_id,
    * declares AllOrNoneHeader, DebuggingHeader and SessionHeader, and nothing
    * else.
    */
+  envelope_head(out, session_id);
   sfcc_buf_puts(out,
-    "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
-    "<env:Envelope xmlns:env=\"http://schemas.xmlsoap.org/soap/envelope/\"\n"
-    "              xmlns=\"http://soap.sforce.com/2006/04/metadata\">\n"
-    "  <env:Header>\n"
-    "    <SessionHeader>\n"
-    "      <sessionId>");
-  /*
-   * A session id is an opaque Salesforce-generated string, so it is not markup
-   * in practice. It is still escaped rather than trusted: putting a credential
-   * into an XML document unsanitised is the one way it could become an injection
-   * point, and the cost of not assuming is a few hundred bytes.
-   */
-  sfcc_buf_append_xml(out, session_id);
-  sfcc_buf_puts(out,
-    "</sessionId>\n"
-    "    </SessionHeader>\n"
-    "  </env:Header>\n"
-    "  <env:Body>\n"
     "    <retrieve>\n"
     "      <retrieveRequest>\n"
     "        <apiVersion>");
@@ -268,9 +309,8 @@ static void build_envelope(const char* api_version, const char* session_id,
   sfcc_buf_puts(out,
     "</unpackaged>\n"
     "      </retrieveRequest>\n"
-    "    </retrieve>\n"
-    "  </env:Body>\n"
-    "</env:Envelope>\n");
+    "    </retrieve>\n");
+  envelope_foot(out);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -748,8 +788,13 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
      * The poll used to be a GET, carried over from the REST deployStatus
      * pattern, where a GET is exactly right.
      */
-    rc = soap_call(c, SFCC_HTTP_POST, endpoint.data, SOAPACTION_EMPTY, NULL,
-                   &doc);
+    sfcc_buf check_env;
+    sfcc_buf_init(&check_env);
+    build_check_envelope(c->access_token, result->id ? result->id : "",
+                         &check_env);
+    rc = soap_call(c, SFCC_HTTP_POST, endpoint.data, SOAPACTION_EMPTY,
+                   check_env.data, &doc);
+    sfcc_buf_free(&check_env);
     if(rc != SFCC_OK){
       sfcc_buf_free(&endpoint);
       sfcc_retrieve_result_free(result);

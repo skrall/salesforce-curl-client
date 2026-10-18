@@ -408,9 +408,31 @@ class Handler(BaseHTTPRequestHandler):
                 % (ctype or "(none)"))
             return True
 
-        # checkRetrieveStatus is a GET with no body, so there is nothing to
-        # check beyond the action. Only the retrieve POST carries an envelope.
+        # The poll is not bodyless. Posting nothing to a SOAP endpoint gives
+        # "Premature end of file" from a real org, so the mock checks for the
+        # envelope the WSDL declares:
+        #
+        #   <checkRetrieveStatus>
+        #     <asyncProcessId type="tns:ID"/>       required
+        #     <includeZip     type="xsd:boolean"/>  required
         if not body:
+            self._soap_fault("soapenv:Client", "Premature end of file")
+            return True
+
+        if "<checkRetrieveStatus>" in body:
+            for tag in ("<asyncProcessId>", "<includeZip>"):
+                if tag not in body:
+                    self._soap_fault(
+                        "soapenv:Client",
+                        "Element {...}%s invalid at this location in type "
+                        "checkRetrieveStatus" % tag.strip("<>"))
+                    return True
+            if "<includeZip>true</includeZip>" not in body:
+                self._soap_fault(
+                    "soapenv:Client",
+                    "includeZip must be true: without it the org returns the "
+                    "status but not the archive")
+                return True
             return False
 
         if "<retrieve>" not in body:
@@ -631,7 +653,9 @@ class Handler(BaseHTTPRequestHandler):
         # its servlet rather than a fault, which is not something a client can
         # usefully report.
         if self._soap() and "<retrieve>" not in raw.decode("utf-8", "replace"):
-            if self._soap_guard(""):
+            # The guard needs the body: the poll carries an envelope, and
+            # passing "" here made the mock fault every legitimate retrieve.
+            if self._soap_guard(raw.decode("utf-8", "replace")):
                 return
             rid = "0Af1B000000RetrieveAAA"
             with STATE.lock:
