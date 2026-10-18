@@ -1,18 +1,40 @@
 name: auto-merge
 
-# Merge Dependabot's pull requests once the tests have passed.
+# Merge Dependabot's pull requests once the tests have actually passed.
 #
-# --auto is the entire mechanism, and it is doing the real work. Without it
-# `gh pr merge` fires the moment the pull request is mergeable, which is before
-# the jobs have finished, so a red build would land on main. With it, GitHub
-# holds the merge until the branch policy on main is satisfied -- and that policy
-# is what requires the six checks to have passed.
+# This does not rely on the repository's required-status-checks policy. It reads
+# the six check runs itself and merges only when all six succeeded on the pull
+# request's current head commit.
+#
+# That is a deliberate change of approach, and it was forced by two failures.
+#
+# The obvious design was to arm `gh pr merge --auto` and let the branch policy do
+# the waiting. That fails silently in the worst direction: if the policy is ever
+# removed, "the requirements are met" becomes "immediately", and dependency
+# updates merge with no test having run while every job reports success.
+#
+# So this workflow added a guard that asked the API whether the policy was still
+# there. Branch protection is an administration endpoint. GITHUB_TOKEN has no
+# scope that reaches it -- administration is not among actions, attestations,
+# checks, contents, deployments, discussions, id-token, issues, packages, pages,
+# pull-requests, repository-projects, security-events or statuses -- so the guard
+# returned 403 on every run and auto-merge never armed.
+#
+# Its logic had been tested before it was pushed, and passed. That test ran with a
+# maintainer's admin token, so it established that the shell was right and nothing
+# about the credentials the workflow is handed. Those are different claims, and
+# conflating them is what let a dead step ship.
+#
+# Checking the results directly needs only `checks: read`, and it makes the
+# guarantee this workflow's own rather than borrowed from a setting it cannot
+# read. If the branch policy is deleted tomorrow this workflow is unaffected; if
+# the checks are deleted, it fails.
 #
 # No third-party action is used here on purpose. This workflow runs on
-# pull_request_target, which gets a write token, and combining that with a
-# mutable third-party tag is how a compromised action ends up with write access
-# to a repository. gh is preinstalled on the runner, so the whole job is two
-# commands against the API and there is nothing to keep up to date here.
+# pull_request_target, which gets a write token, and pairing that with a mutable
+# third-party tag is how a compromised action ends up with write access to a
+# repository. gh is preinstalled, so the job is API calls and nothing to keep
+# current.
 
 on:
   pull_request_target:
@@ -22,98 +44,208 @@ on:
       - reopened
       - ready_for_review
 
-permissions:
-  # contents: write is what a merge actually needs. pull-requests: write on its
-  # own is enough to enable auto-merge but not to perform the merge, so leaving it
-  # out makes the workflow fail at the worst moment: the first Dependabot pull
-  # request, days after this was merged.
-  contents: write
-  pull-requests: write
+  # Arm this by hand at any time, which is what makes the path testable without
+  # waiting for Dependabot to run on its weekly schedule. The first automatic run
+  # found a bug in this workflow within minutes of the config landing; a trigger
+  # that only fires from a schedule means the next one is found on an unattended
+  # merge instead.
+  #
+  # Dispatching needs write access, which is the same permission as merging.
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: "Pull request number to merge once its checks pass"
+        required: true
+        type: string
+      dry-run:
+        description: "Report the check results, without waiting or merging"
+        required: false
+        default: false
+        type: boolean
 
-# One merge at a time. Overlapping Dependabot pull requests would each hold their
-# own set of checks, and the shared e2e work they need makes that wasteful rather
-# than merely untidy.
+permissions:
+  # contents: write is what a merge needs. pull-requests: read to read the pull
+  # request. checks: read to read the results this workflow verifies.
+  contents: write
+  pull-requests: read
+  checks: read
+
+# One merge at a time. The event name is in the group so a manual run against a
+# pull request that already has an automatic one queued does not queue behind it
+# and silently report nothing.
 concurrency:
-  group: auto-merge-${{ github.event.pull_request.number }}
+  group: auto-merge-${{ github.event_name }}-${{ github.event.pull_request.number || inputs.pr }}
   cancel-in-progress: false
 
 jobs:
   dependabot:
     name: dependabot
     runs-on: ubuntu-latest
+    # Hours, because this job waits for CI rather than racing it. The waits here
+    # are ~2 minutes; the ceiling is for a slow or queued runner.
+    timeout-minutes: 60
 
-    # If the author is not Dependabot, do nothing at all. Dependabot is the only
-    # thing this rule is for, and a human pull request that happened to be green
-    # should never be closed by it.
+    # On the automatic path, do nothing unless the author is Dependabot. A human
+    # pull request that happened to be green should never be merged by this rule;
+    # if you want one merged, merge it.
     #
     # That guard is also what makes pull_request_target safe here: this workflow
     # never checks out the pull request or runs any of its code, so a fork cannot
-    # reach the write token even if someone opens a pull request from one.
-    if: github.actor == 'dependabot[bot]'
+    # reach the write token even if someone opens a pull request from one. A
+    # dispatched run is an explicit request by someone who can already merge, and
+    # the next step still refuses a pull request whose branch is in a fork.
+    if: github.actor == 'dependabot[bot]' || github.event_name == 'workflow_dispatch'
 
     steps:
-      # Refuse to arm the merge unless the gate it relies on is actually in place.
-      #
-      # This is not defensive decoration. --auto merges as soon as the repository's
-      # requirements are met, and if the required-status-checks policy on main were
-      # ever deleted then "met" means "immediately" -- so this workflow would start
-      # merging dependency updates without any test having run, and nothing would
-      # say so. A missing policy is the one condition that has to fail loudly,
-      # because it is the one that turns this from guarded into unguarded.
-      #
-      # A 404 here -- no protection configured -- fails the step, which fails the
-      # job, which is the intended outcome.
-      - name: Confirm the gate still exists
+      # Work out which pull request, and refuse one whose branch is in a fork.
+      - name: Resolve the target
+        id: target
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
-          BRANCH: ${{ github.event.repository.default_branch }}
-          PR: ${{ github.event.pull_request.number }}
+          PR: ${{ github.event.pull_request.number || inputs.pr }}
         run: |
           set -euo pipefail
-          echo "Checking required status checks on $BRANCH of $REPO"
-          contexts=$(gh api "repos/$REPO/branches/$BRANCH/protection/required_status_checks" \
-            --jq '.contexts | join(", ")')
-          echo "Required: $contexts"
-          for needed in \
-            "linux (gcc)" "linux (clang)" "macos" \
-            "windows (msvc)" "end-to-end" "source hygiene"; do
-            case ", $contexts, " in
-              *", $needed, "*) ;;
-              *) echo "::error::$needed is not a required check on $BRANCH."
-                 echo "::error::auto-merge would not wait for it, so this refuses to arm."
-                 exit 1 ;;
-            esac
-          done
-          echo "All six checks are required. Safe to arm."
-
-      # Merge, not squash. A squashed dependency commit is harder to revert than a
-      # merge commit, and these are changes worth being able to back out of a
-      # release with a single git revert --m.
-      #
-      # The result is a merge commit whose message is Dependabot's, pointing at
-      # its own pull request, so the provenance survives in the history.
-      #
-      # --repo is required, not decoration. This step deliberately does not check
-      # the repository out -- checking out is what would let a fork's code run with
-      # this workflow's write token -- and without a checkout gh has no repository
-      # context to infer, so it stops with "failed to run git: not a git
-      # repository". Naming the repository is what lets the security property and
-      # the functionality coexist.
-      - name: Enable auto-merge
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR: ${{ github.event.pull_request.number }}
-          HEAD: ${{ github.event.pull_request.head.ref }}
-          URL: ${{ github.event.pull_request.html_url }}
-        run: |
-          set -euo pipefail
-          echo "Enabling auto-merge on #$PR ($HEAD)"
-          echo "Gate: the branch policy on the default branch requires all six CI checks."
-          if gh pr merge --auto --merge "$PR" --repo "$REPO"; then
-            echo "Auto-merge enabled. GitHub will merge once the checks pass."
-          else
-            echo "::error::could not enable auto-merge on $URL"
+          if [ -z "$PR" ]; then
+            echo "::error::no pull request number; pass one as an input"
             exit 1
           fi
+          head_repo=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.repo.full_name')
+          echo "Pull request #$PR, head repository: $head_repo"
+          if [ "$head_repo" != "$REPO" ]; then
+            echo "::error::#$PR comes from $head_repo, not this repository."
+            echo "::error::a fork's branch must never be merged by this workflow."
+            exit 1
+          fi
+          state=$(gh api "repos/$REPO/pulls/$PR" --jq '.state')
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
+          echo "state=$state" >> "$GITHUB_OUTPUT"
+          echo "head=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.ref')" >> "$GITHUB_OUTPUT"
+          echo "url=$(gh api "repos/$REPO/pulls/$PR" --jq '.html_url')" >> "$GITHUB_OUTPUT"
+          if [ "$state" != "open" ]; then
+            echo "::warning::#$PR is $state, not open. Nothing to merge."
+          fi
+
+      # The gate. Poll until all six checks have completed on the pull request's
+      # current head commit, then merge.
+      #
+      # The head SHA is re-read on every poll, so a push that arrives mid-wait
+      # moves the target and the verdict is computed against the new commit. That
+      # is the whole reason this does not use --auto: a merge gated on the branch
+      # policy can be satisfied by results for a commit that is no longer the head,
+      # and the fix for that is to make the workflow check the head itself.
+      - name: Wait for the checks, then merge
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.target.outputs.number }}
+          HEAD: ${{ steps.target.outputs.head }}
+          URL: ${{ steps.target.outputs.url }}
+          DRY: ${{ inputs.dry-run }}
+          TIMEOUT_S: "2400"
+        run: |
+          set -euo pipefail
+
+          REQUIRED="linux (gcc)|linux (clang)|macos|windows (msvc)|end-to-end|source hygiene"
+
+          # A missing pull request number reaches the API as /pulls/ and comes back
+          # as a 404 naming nothing useful. This workflow lost an hour to that: a
+          # step output was dropped in a rewrite and every request went to an empty
+          # path. actionlint cannot see that a step output is never written, so it
+          # has to be checked where the value is used.
+          if [ -z "$PR" ]; then
+            echo "::error::no pull request number reached this step"
+            exit 1
+          fi
+
+          deadline=$(( $(date +%s) + TIMEOUT_S ))
+          last_line=""
+
+          while : ; do
+            sha=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+            state=$(gh api "repos/$REPO/pulls/$PR" --jq '.state')
+            if [ "$state" != "open" ]; then
+              echo "Pull request #$PR is $state. Stopping without merging."
+              exit 0
+            fi
+
+            rows=$(gh api "repos/$REPO/commits/$sha/check-runs?per_page=100" \
+              --jq '.check_runs[] | "\(.name)|\(.status)|\(.conclusion // "-")"')
+
+            waiting=""
+            broke=""
+            green=1
+
+            # Iterate the *required* names, not the ones the API returned.
+            #
+            # Walking the returned rows instead is the obvious way to write this
+            # and it is wrong: a check that never ran is simply absent from the
+            # response, so iterating what came back treats "not reported" as
+            # "not required" and passes. Six of six is a claim about the required
+            # set, so the required set is what has to be walked. Found by running
+            # a fixture with one of the six removed, which reported all six
+            # green.
+            IFS='|' read -r -a reqs <<< "$REQUIRED"
+            for name in "${reqs[@]}"; do
+              # -F'|' with $1 == name is an exact match. Check names here contain
+              # spaces and parentheses, so neither a grep pattern nor a substring
+              # test would do.
+              line=$(printf '%s\n' "$rows" | awk -F'|' -v n="$name" '$1 == n { print; exit }')
+              if [ -z "$line" ]; then
+                green=0
+                waiting="${waiting}${waiting:+, }$name (not reported)"
+                continue
+              fi
+              status=$(printf '%s' "$line" | cut -d'|' -f2)
+              conclusion=$(printf '%s' "$line" | cut -d'|' -f3)
+              if [ "$status" != "completed" ]; then
+                green=0
+                waiting="${waiting}${waiting:+, }$name ($status)"
+              elif [ "$conclusion" != "success" ]; then
+                green=0
+                broke="${broke}${broke:+, }$name ($conclusion)"
+              fi
+            done
+
+            if [ -n "$broke" ]; then
+              echo "::error::checks did not pass on $sha: $broke"
+              exit 1
+            fi
+
+            if [ "$green" -eq 1 ]; then
+              echo "All six checks succeeded on $sha"
+              if [ "$DRY" = "true" ]; then
+                echo "Dry run: stopping before the merge."
+                exit 0
+              fi
+              echo "Merging #$PR ($HEAD)"
+              # Merge, not squash: a squashed dependency commit is harder to revert
+              # than a merge commit, and these are changes worth backing out of a
+              # release with a single `git revert -m 1`.
+              #
+              # --repo is required. This step deliberately never checks the
+              # repository out -- that is what would let a fork's code run with
+              # this workflow's write token -- and without a checkout gh has no
+              # repository context and stops with "not a git repository".
+              if gh pr merge --merge "$PR" --repo "$REPO"; then
+                echo "Merged."
+              else
+                echo "::error::could not merge $URL"
+                exit 1
+              fi
+              exit 0
+            fi
+
+            # Only report when something changed, so a long wait is legible.
+            line="$sha: waiting on $waiting"
+            if [ "$line" != "$last_line" ]; then
+              echo "$line"
+              last_line="$line"
+            fi
+
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::timed out after ${TIMEOUT_S}s waiting on: $waiting"
+              exit 1
+            fi
+            sleep 20
+          done

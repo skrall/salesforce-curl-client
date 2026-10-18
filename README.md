@@ -157,7 +157,28 @@ Dependabot watches the workflows and the Docker base image, weekly on Mondays:
 
 Updates arrive grouped, one PR per ecosystem rather than one per dependency.
 A green PR from Dependabot merges itself once the six CI jobs pass — see
-`.github/workflows/auto-merge.yml` and the branch ruleset on `main`.
+`.github/workflows/auto-merge.yml` and the branch policy on `main`.
+
+That workflow can also be run by hand (**Actions → auto-merge → Run workflow**,
+naming a PR number, with a dry-run option). It exists because the automatic path
+can only be exercised when Dependabot happens to run, which left the path worth
+testing — does it correctly decide whether the tests passed — unproven. The first
+automatic run found a bug in it within minutes of the config being merged.
+Dispatching requires write access, which is the same permission as merging, and a
+PR whose branch is in a fork is refused outright.
+
+The workflow reads the six check results itself rather than leaning on the
+branch's required-checks policy, and merges only when all six succeeded **on the
+PR's current head commit**. Two reasons: a policy that is later deleted would turn
+"the requirements are met" into "immediately", so updates would merge untested
+while every job reported success; and results for a commit that is no longer the
+head would otherwise satisfy a merge of a newer one. Re-reading the head SHA on
+each poll is what makes that second case impossible. It needs only `checks: read`
+— no permission that reaches branch protection, which `GITHUB_TOKEN` does not
+have.
+
+Security advisories are enabled too, so a CVE in either action or the base image
+raises an alert rather than waiting for the weekly version sweep.
 
 What is **not** watched, and why:
 
