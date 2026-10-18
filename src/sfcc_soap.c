@@ -607,11 +607,15 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
   const char* action_hdr_retrieve = "SOAPAction: " SOAPACTION_RETRIEVE;
   const char* action_hdr_check = "SOAPAction: " SOAPACTION_CHECK;
 
+  /* Bare version in the path, not the REST "v64.0" spelling: the endpoint is
+   * /services/Soap/m/64.0 and a real org answers the prefixed form with
+   *   soapenv:Client: Invalid Api version specified on URL : /m/v64.0
+   * The envelope needs the same treatment and gets it from bare_version(). */
   sfcc_buf endpoint;
   sfcc_buf_init(&endpoint);
   sfcc_buf_puts(&endpoint, c->instance_url);
   sfcc_buf_puts(&endpoint, "/services/Soap/m/");
-  sfcc_buf_puts(&endpoint, c->api_version);
+  sfcc_buf_puts(&endpoint, bare_version(c->api_version));
 
   sfcc_buf doc;
   sfcc_buf_init(&doc);

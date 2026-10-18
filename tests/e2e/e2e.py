@@ -335,6 +335,16 @@ def test_retrieve(c, r):
                 for q in actions),
             "on the versioned metadata SOAP path", repr(actions))
 
+    r.section("retrieve: the URL carries the bare version, not the REST one")
+    # A real org answers /services/Soap/m/v64.0 with "Invalid Api version
+    # specified on URL". The envelope was already bare; the path was not, and a
+    # permissive regex in the mock let that through to a real org. Both spellings
+    # are asserted here so the path cannot regress on its own.
+    paths = [q[1] for q in MOCK.requests if q[1].startswith("/services/Soap/")]
+    r.check(all("/services/Soap/m/64.0" in q for q in paths),
+            "the path is /services/Soap/m/64.0", repr(paths))
+    r.lacks(" ".join(paths), "/m/v64.0", "and never the v-prefixed form")
+
     r.section("retrieve: a failed retrieve names the org's own reason")
     path = c.write("package.xml",
                    PACKAGE_XML.replace("ApexClass", "FailMe"))

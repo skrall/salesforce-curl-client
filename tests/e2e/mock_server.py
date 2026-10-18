@@ -355,8 +355,20 @@ class Handler(BaseHTTPRequestHandler):
         return raw.strip().strip('"')
 
     def _soap(self):
-        """True when this is a Metadata SOAP endpoint, whatever the operation."""
-        return re.match(r"^/services/Soap/m/v[0-9.]+$", urlparse(self.path).path)
+        """True when this is a Metadata SOAP endpoint, whatever the operation.
+
+        The version is matched WITHOUT an optional "v" prefix, deliberately: a
+        real org answers /services/Soap/m/v64.0 with "Invalid Api version
+        specified on URL". A permissive regex here would let that ship, and did.
+        """
+        if not re.match(r"^/services/Soap/m/v?[0-9.]+$", urlparse(self.path).path):
+            return False
+        if re.match(r"^/services/Soap/m/v[0-9.]+$", urlparse(self.path).path):
+            self._soap_fault("soapenv:Client",
+                             "Invalid Api version specified on URL : %s"
+                             % urlparse(self.path).path)
+            return False
+        return True
 
     def _soap_fault(self, code, text):
         return self._send_raw(500, SOAP_FAULT.replace("sf:INVALID_SESSION_ID", code)
