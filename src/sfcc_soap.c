@@ -416,9 +416,31 @@ static void describe_fault(const char* body, char* out, size_t outsz){
   if(tag_value(body, "faultstring", &msg)){ /* already unescaped */ }
 
   if(msg.len == 0){
-    /* Not a fault, or one we cannot read. Keep the org's own words rather than
-     * substituting something invented. */
-    snprintf(out, outsz, "%s", body && *body ? body : "(no response)");
+    /*
+     * Not a SOAP fault. The likely cause is that the endpoint answered before
+     * it looked at the body at all -- a wrong method or path produces an HTML
+     * error page from the servlet, not a fault -- and echoing a page of markup
+     * at the user is unreadable. Say what it was instead.
+     */
+    if(body != NULL && (strstr(body, "<html") != NULL ||
+                        strstr(body, "<HTML") != NULL)){
+      sfcc_buf title;
+      sfcc_buf_init(&title);
+      /* The one line of an HTML error page worth having. */
+      if(tag_text(body, "title", &title)){
+        unescape(&title);
+        snprintf(out, outsz,
+                 "the server returned an HTML page rather than a SOAP response"
+                 " (%s) -- the request never reached the API", title.data);
+      }else{
+        snprintf(out, outsz,
+                 "the server returned an HTML page rather than a SOAP response"
+                 " -- the request never reached the API");
+      }
+      sfcc_buf_free(&title);
+    }else{
+      snprintf(out, outsz, "%s", body && *body ? body : "(no response)");
+    }
   }else if(code.len > 0){
     snprintf(out, outsz, "%s: %s", code.data, msg.data);
   }else{
@@ -701,7 +723,16 @@ sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
      * and a retrieve that runs for a quarter of an hour would otherwise hold
      * every intermediate response until it finished. */
     sfcc_buf_free(&doc);
-    rc = soap_call(c, SFCC_HTTP_GET, endpoint.data, SOAPACTION_EMPTY, NULL,
+    /*
+     * POST, not GET. Every SOAP operation is a POST in the SOAP 1.1 binding --
+     * jsforce's soap() hardcodes method: 'POST' for retrieve and
+     * checkRetrieveStatus alike -- and Salesforce answers anything else with an
+     * HTML "Error 405 Only POST allowed" from its servlet, which is not a SOAP
+     * fault and so arrives here as markup rather than as anything parseable.
+     * The poll used to be a GET, carried over from the REST deployStatus
+     * pattern, where a GET is exactly right.
+     */
+    rc = soap_call(c, SFCC_HTTP_POST, endpoint.data, SOAPACTION_EMPTY, NULL,
                    &doc);
     if(rc != SFCC_OK){
       sfcc_buf_free(&endpoint);

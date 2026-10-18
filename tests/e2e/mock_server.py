@@ -271,6 +271,16 @@ RETRIEVE_FAILED_SOAP = """<?xml version="1.0" encoding="UTF-8"?>
   </soapenv:Body>
 </soapenv:Envelope>"""
 
+ONLY_POST_PAGE = """<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html;charset=utf-8"/>
+<title>Error 405 Only POST allowed</title>
+</head>
+<body><h2>HTTP ERROR 405</h2>
+<p>Problem accessing /services/Soap/m/64.0. Reason:
+<pre>    Only POST allowed</pre></p></body>
+</html>"""
+
 SOAP_FAULT = """<?xml version="1.0" encoding="UTF-8"?>
 <soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
   <soapenv:Body>
@@ -466,25 +476,13 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         q = parse_qs(u.query)
 
-        if self._soap():
-            if self._soap_guard(""):
-                return
-            rid = "0Af1B000000RetrieveAAA"
-            if rid == "unknown":
-                return self._soap_fault("sf:INVALID_ID", "no such retrieve")
-            with STATE.lock:
-                n = STATE.soap_polls.get(rid, 0)
-                STATE.soap_polls[rid] = n + 1
-            # Pending once, then Succeeded. Polling is the thing worth forcing:
-            # a client that treats the first response as final would never see
-            # the archive and would fail here for the right reason.
-            if n < 1:
-                return self._send_raw(
-                    200, (RETRIEVE_PENDING_SOAP % rid).encode("utf-8"),
-                    "text/xml")
-            return self._send_raw(
-                200, (RETRIEVE_SOAP % {"id": rid, "zip": RETRIEVE_ZIP_B64})
-                .encode("utf-8"), "text/xml")
+        # A GET on a SOAP endpoint gets a servlet 405 and an HTML page, not a
+        # fault -- which is what the client saw when its poll used GET, carried
+        # over from the REST deployStatus pattern where a GET is right. Every
+        # SOAP operation is a POST.
+        if u.path.startswith("/services/Soap/"):
+            return self._send_raw(405, ONLY_POST_PAGE.encode("utf-8"),
+                                  "text/html")
 
         if self._path_is("/services/data/{version}/query"):
             # The statement must arrive fully decoded and identical to what we
@@ -616,6 +614,28 @@ class Handler(BaseHTTPRequestHandler):
         self._note()
         raw = self._body()
         u = urlparse(self.path)
+
+        # A bodyless POST to the SOAP endpoint is checkRetrieveStatus. Every SOAP
+        # operation is a POST: Salesforce answers a GET with an HTML 405 from
+        # its servlet rather than a fault, which is not something a client can
+        # usefully report.
+        if self._soap() and "<retrieve>" not in raw.decode("utf-8", "replace"):
+            if self._soap_guard(""):
+                return
+            rid = "0Af1B000000RetrieveAAA"
+            with STATE.lock:
+                n = STATE.soap_polls.get(rid, 0)
+                STATE.soap_polls[rid] = n + 1
+            # Pending once, then Succeeded. Polling is the thing worth forcing:
+            # a client that treats the first response as final would never see
+            # the archive and would fail here for the right reason.
+            if n < 1:
+                return self._send_raw(
+                    200, (RETRIEVE_PENDING_SOAP % rid).encode("utf-8"),
+                    "text/xml")
+            return self._send_raw(
+                200, (RETRIEVE_SOAP % {"id": rid, "zip": RETRIEVE_ZIP_B64})
+                .encode("utf-8"), "text/xml")
 
         if self._soap() and "<retrieve>" in raw.decode("utf-8", "replace"):
             body = raw.decode("utf-8", "replace")
