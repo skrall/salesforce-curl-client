@@ -118,6 +118,7 @@ jobs:
             exit 1
           fi
           state=$(gh api "repos/$REPO/pulls/$PR" --jq '.state')
+          echo "number=$PR" >> "$GITHUB_OUTPUT"
           echo "state=$state" >> "$GITHUB_OUTPUT"
           echo "head=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.ref')" >> "$GITHUB_OUTPUT"
           echo "url=$(gh api "repos/$REPO/pulls/$PR" --jq '.html_url')" >> "$GITHUB_OUTPUT"
@@ -146,6 +147,16 @@ jobs:
           set -euo pipefail
 
           REQUIRED="linux (gcc)|linux (clang)|macos|windows (msvc)|end-to-end|source hygiene"
+
+          # A missing pull request number reaches the API as /pulls/ and comes back
+          # as a 404 naming nothing useful. This workflow lost an hour to that: a
+          # step output was dropped in a rewrite and every request went to an empty
+          # path. actionlint cannot see that a step output is never written, so it
+          # has to be checked where the value is used.
+          if [ -z "$PR" ]; then
+            echo "::error::no pull request number reached this step"
+            exit 1
+          fi
 
           deadline=$(( $(date +%s) + TIMEOUT_S ))
           last_line=""
