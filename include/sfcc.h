@@ -254,6 +254,69 @@ typedef struct {
 /* Fill opts with defaults: NoTestRun, unpackaged, 5s polls, 900s deadline. */
 void sfcc_deploy_options_defaults(sfcc_deploy_options* opts);
 
+/* --------------------------------------------------------------------------
+ * Retrieve
+ *
+ * The one part of the Metadata API with no REST equivalent: Salesforce's own
+ * CLI and jsforce both retrieve over SOAP, and the REST resource covers deploy
+ * only. So this is the client's only non-REST transport, and it is deliberately
+ * limited to what retrieve needs.
+ * -------------------------------------------------------------------------- */
+
+typedef struct {
+  /* Poll interval and overall deadline in seconds. Defaults are used for
+   * anything <= 0. Retrieval is asynchronous and a wide package.xml can run for
+   * minutes, so the deadline is generous. */
+  long poll_interval_s;
+  long timeout_s;
+} sfcc_retrieve_options;
+
+/* Fill opts with defaults: 5s polls, 900s deadline. */
+void sfcc_retrieve_options_defaults(sfcc_retrieve_options* opts);
+
+/*
+ * The outcome of a retrieve, after polling has finished.
+ *
+ * bytes is the size of the archive written, which is not the size of the
+ * response: the org sends it base64-encoded inside XML.
+ */
+typedef struct {
+  char* id;         /* async process id, for looking it up later   */
+  char* status;     /* Succeeded | Failed | Canceled | Pending |... */
+  int  done;
+  int  succeeded;
+  long bytes;       /* archive size written                        */
+} sfcc_retrieve_result;
+
+void sfcc_retrieve_result_free(sfcc_retrieve_result* result);
+
+/*
+ * Retrieve the components named by a package.xml manifest.
+ *
+ * Writes the org's archive to out_path exactly as received: the Metadata API
+ * returns a single base64 zipFile and no per-file content, so this does not
+ * unpack it and does not create a directory tree. Unpacking is left to the
+ * caller, which also means no filename in a remote archive is ever trusted --
+ * the zip-slip class of problem does not arise here at all.
+ *
+ * The manifest is not parsed. Its <Package> element has the same shape and the
+ * same default namespace as the <unpackaged> element the SOAP request wants, so
+ * the contents are copied across verbatim. A manifest that declares a namespace
+ * prefix on its contents is refused rather than sent in the wrong namespace.
+ *
+ * The API version comes from the client's configuration, like every other call,
+ * rather than from the manifest. Note that Salesforce still lets a <version> in
+ * the manifest govern the shape of the components returned, so it is not fully
+ * authoritative either way.
+ *
+ * A failed retrieve is reported as an error, since there is no archive to
+ * hand back; check the return value rather than succeeded.
+ */
+sfcc_status sfcc_retrieve(sfcc_client* c, const char* manifest_path,
+                          const char* out_path,
+                          const sfcc_retrieve_options* opts,
+                          sfcc_retrieve_result* result);
+
 /*
  * The outcome of a deploy, after polling has finished.
  *

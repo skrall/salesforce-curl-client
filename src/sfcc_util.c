@@ -140,6 +140,41 @@ static int is_unreserved(unsigned char c){
          c == '-' || c == '.' || c == '_' || c == '~';
 }
 
+/*
+ * Append with the five XML predefined entities escaped.
+ *
+ * Distinct from sfcc_buf_append_encoded, which percent-encodes for URLs. Using
+ * that one here turns a session id like "abc!def==" into "abc%21def%3D%3D",
+ * which is neither valid XML-escaping nor the value the org is expecting.
+ */
+int sfcc_buf_append_xml(sfcc_buf* b, const char* src){
+  if(b == NULL || src == NULL){
+    return -1;
+  }
+  for(const char* p = src ; *p ; ++p){
+    const char* rep = NULL;
+    switch(*p){
+      case '&':  rep = "&amp;";  break;
+      case '<':  rep = "&lt;";   break;
+      case '>':  rep = "&gt;";   break;
+      case '"':  rep = "&quot;"; break;
+      case '\'': rep = "&apos;"; break;
+      default:   break;
+    }
+    if(rep != NULL){
+      if(sfcc_buf_puts(b, rep)){
+        return -1;
+      }
+    }else{
+      const char c = *p;
+      if(sfcc_buf_append(b, &c, 1)){
+        return -1;
+      }
+    }
+  }
+  return 0;
+}
+
 int sfcc_buf_append_encoded(sfcc_buf* b, const char* src){
   static const char HEX[] = "0123456789ABCDEF";
   if(b == NULL || src == NULL){

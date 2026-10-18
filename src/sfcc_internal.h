@@ -70,6 +70,8 @@ int   sfcc_buf_printf(sfcc_buf* b, const char* fmt, ...) SFCC_PRINTF_LIKE(2, 3);
  * encoded. SOQL in particular contains spaces, quotes and '+', all of which
  * will corrupt a query if they reach the URL verbatim. */
 int   sfcc_buf_append_encoded(sfcc_buf* b, const char* src);
+/* XML entity escaping, for the SOAP envelope. */
+int   sfcc_buf_append_xml(sfcc_buf* b, const char* src);
 void  sfcc_buf_free(sfcc_buf* b);
 
 /* ------------------------------------------------------------------------ */

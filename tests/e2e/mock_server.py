@@ -56,6 +56,22 @@ BLOB = b"\x89PNG\r\n\x1a\n\x00\x01\x02binary-blob"
 #     driven by content rather than by the header.
 #   * Account has keyPrefix out of alphabetical order, so a renderer that sorts
 #     by the wrong column or drops a field shows up immediately.
+# A zip is binary and must survive the round trip byte-exact, so the fixture is
+# deliberately not a real archive -- only a payload that includes NULs and high
+# bytes, which is what catches a client treating it as a C string. The PK\x03\x04
+# at the front is a genuine zip local-file header, so `file` recognises it.
+RETRIEVE_ZIP = b"PK\x03\x04\x00\x00binary-retrieve-payload\x00\xff\xfe\x80\x01"
+
+# The encoding of RETRIEVE_ZIP, wrapped at a line break inside the XML because
+# Salesforce does that and a strict base64 decoder would reject it -- so the
+# wrap here is what keeps the decoder's whitespace tolerance exercised rather
+# than merely claimed. Regenerate with base64.b64encode(RETRIEVE_ZIP).
+RETRIEVE_ZIP_B64 = (
+    "UEsDBAAAYmluYXJ5LXJldHJp"
+    "\n"
+    "ZXZlLXBheWxvYWQA//6AAQ=="
+)
+
 SOBJECTS = {
     "encoding": "UTF-8",
     "maxBatchSize": 200,
@@ -177,6 +193,12 @@ class _State:
         self.base_url = ""
         self.deploys = {}
         self.requests = []      # (method, path, authorization, content_type)
+        # Raw SOAP envelopes, so a test can assert on what the client actually
+        # sent. The SOAP path has no other observable: the org-facing behaviour
+        # is the request, and asserting on it is what makes the envelope
+        # construction testable at all.
+        self.soap_bodies = []
+        self.soap_polls = {}    # retrieve id -> number of checkStatus calls
         self.lock = threading.Lock()
 
     def record(self, method, path, auth, ctype):
@@ -192,6 +214,73 @@ class _State:
 
 
 STATE = _State()
+
+
+RETRIEVE_SOAP = """<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Body>
+    <retrieveResponse>
+      <result>
+        <id>%(id)s</id>
+        <done>true</done>
+        <status>Succeeded</status>
+        <success>true</success>
+        <fileProperties>
+          <contentType>application/json</contentType>
+          <fileName>package.xml</fileName>
+          <fullName>package.xml</fullName>
+        </fileProperties>
+        <zipFile>%(zip)s</zipFile>
+      </result>
+    </retrieveResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+RETRIEVE_PENDING_SOAP = """<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Body>
+    <retrieveResponse>
+      <result>
+        <id>%s</id>
+        <done>false</done>
+        <status>Pending</status>
+      </result>
+    </retrieveResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+RETRIEVE_FAILED_SOAP = """<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/"
+                  xmlns="http://soap.sforce.com/2006/04/metadata">
+  <soapenv:Body>
+    <retrieveResponse>
+      <result>
+        <id>%s</id>
+        <done>true</done>
+        <status>Failed</status>
+        <success>false</success>
+        <messages>
+          <message>
+            <problem>No component retrieved: nothing matched the manifest &amp; nothing else.</problem>
+          </message>
+        </messages>
+      </result>
+    </retrieveResponse>
+  </soapenv:Body>
+</soapenv:Envelope>"""
+
+SOAP_FAULT = """<?xml version="1.0" encoding="UTF-8"?>
+<soapenv:Envelope xmlns:soapenv="http://schemas.xmlsoap.org/soap/envelope/">
+  <soapenv:Body>
+    <soapenv:Fault>
+      <faultcode>sf:INVALID_SESSION_ID</faultcode>
+      <faultstring>Invalid Session ID found in SessionHeader: expired or invalid</faultstring>
+      <detail><stackTrace>A very long Java stack trace nobody can act on.</stackTrace></detail>
+    </soapenv:Fault>
+  </soapenv:Body>
+</soapenv:Envelope>"""
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -259,6 +348,20 @@ class Handler(BaseHTTPRequestHandler):
         regex = regex.replace(re.escape("*"), "[^/]+")
         return re.match("^" + regex + "$", u.path) is not None
 
+    def _soap_action(self):
+        """The SOAPAction header, unquoted. Absent entirely is a real failure
+        mode: SOAP 1.1 requires it, so a client that omits it is broken."""
+        raw = self.headers.get("SOAPAction") or ""
+        return raw.strip().strip('"')
+
+    def _soap(self):
+        """True when this is a Metadata SOAP endpoint, whatever the operation."""
+        return re.match(r"^/services/Soap/m/v[0-9.]+$", urlparse(self.path).path)
+
+    def _soap_fault(self, code, text):
+        return self._send_raw(500, SOAP_FAULT.replace("sf:INVALID_SESSION_ID", code)
+                              .encode("utf-8"), "text/xml")
+
     # -- GET ----------------------------------------------------------------
 
     def do_GET(self):
@@ -267,6 +370,24 @@ class Handler(BaseHTTPRequestHandler):
             return
         u = urlparse(self.path)
         q = parse_qs(u.query)
+
+        if self._soap() and self._soap_action() == "checkRetrieveStatus":
+            rid = "0Af1B000000RetrieveAAA"
+            if rid == "unknown":
+                return self._soap_fault("sf:INVALID_ID", "no such retrieve")
+            with STATE.lock:
+                n = STATE.soap_polls.get(rid, 0)
+                STATE.soap_polls[rid] = n + 1
+            # Pending once, then Succeeded. Polling is the thing worth forcing:
+            # a client that treats the first response as final would never see
+            # the archive and would fail here for the right reason.
+            if n < 1:
+                return self._send_raw(
+                    200, (RETRIEVE_PENDING_SOAP % rid).encode("utf-8"),
+                    "text/xml")
+            return self._send_raw(
+                200, (RETRIEVE_SOAP % {"id": rid, "zip": RETRIEVE_ZIP_B64})
+                .encode("utf-8"), "text/xml")
 
         if self._path_is("/services/data/{version}/query"):
             # The statement must arrive fully decoded and identical to what we
@@ -398,6 +519,36 @@ class Handler(BaseHTTPRequestHandler):
         self._note()
         raw = self._body()
         u = urlparse(self.path)
+
+        if self._soap() and self._soap_action() == "retrieve":
+            body = raw.decode("utf-8", "replace")
+            with STATE.lock:
+                STATE.soap_bodies.append(body)
+
+            # The session id is the only credential a retrieve carries, so a
+            # wrong one must be a fault rather than a successful retrieve.
+            if MOCK_TOKEN not in body:
+                return self._soap_fault(
+                    "sf:INVALID_SESSION_ID",
+                    "Invalid Session ID found in SessionHeader: expired")
+
+            # A manifest naming a FailMe type asks for the failure shape, so the
+            # error path is exercised without a second endpoint.
+            if "FailMe" in body:
+                with STATE.lock:
+                    STATE.soap_polls["fail"] = 0
+                return self._send_raw(
+                    200, (RETRIEVE_FAILED_SOAP % ("0AfRETRIEVEFAIL"))
+                    .encode("utf-8"), "text/xml")
+
+            rid = "0Af1B000000RetrieveAAA"
+            with STATE.lock:
+                STATE.soap_polls[rid] = 0
+            # Pending, as a real org answers: retrieve is asynchronous, and a
+            # mock that returned the archive here would mean the poll loop is
+            # never executed by any test.
+            return self._send_raw(
+                200, (RETRIEVE_PENDING_SOAP % rid).encode("utf-8"), "text/xml")
 
         if u.path == "/services/oauth2/token":
             # The assertion that matters most: this endpoint must be form

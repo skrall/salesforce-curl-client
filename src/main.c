@@ -65,6 +65,7 @@ static void usage(FILE* out){
 "  sobjects                    every object in the org, as a table\n"
 "  versions                    API versions this org supports\n"
 "  deploy --zip <file>         deploy a prebuilt metadata package\n"
+"  retrieve <package.xml>      fetch metadata into a .zip, unpacked by you\n"
 "  rest <path>                 one raw REST call, with auth applied\n"
 "\n"
 "Options:\n"
@@ -131,6 +132,23 @@ static void usage(FILE* out){
 "  SRCH      searchable      LAY     layoutable    MRG    mergeable\n"
 "  TRIG      triggerable\n"
 "  Salesforce reports more flags than these; --raw prints all of them.\n"
+"\n"
+"retrieve options:\n"
+"  --out <file.zip>            where to write the archive (default metadata.zip)\n"
+"  --retrieve-poll-interval <s>  status poll interval (default 5)\n"
+"  --retrieve-timeout <s>      give up waiting after this long (default 900)\n"
+"  Retrieve is SOAP, unlike every other command here: the Metadata API has no\n"
+"  REST equivalent, and this is the only place the client speaks SOAP. The org\n"
+"  returns one base64 archive and nothing else, so sfcc writes that file as\n"
+"  received and does not unpack it -- which also means no filename from the\n"
+"  archive is ever trusted. Unpack it yourself, then deploy it straight back:\n"
+"    sfcc retrieve package.xml --out build/metadata.zip\n"
+"    unzip -q build/metadata.zip -d metadata\n"
+"  The manifest is not parsed. Its <Package> element has the same shape and the\n"
+"  same default namespace as the SOAP request's <unpackaged>, so its contents\n"
+"  are copied across unchanged. A manifest using a namespace prefix is refused\n"
+"  rather than sent in the wrong namespace. The API version comes from\n"
+"  --api-version, like every other command.\n"
 "\n"
 "Deploy options:\n"
 "  --validate-only             check the package without changing anything\n"
@@ -1083,6 +1101,29 @@ static int cmd_describe(sfcc_client* c, const char* sobject,
   return rc_out ? 1 : 0;
 }
 
+/*
+ * sfcc retrieve -- writes the org's archive, and does not unpack it.
+ *
+ * The single output file is the whole deliverable. Unpacking is the caller's,
+ * which is not a shortcut so much as the reason this is safe: no path in the
+ * archive is ever used, so there is nothing for a hostile org to point outside
+ * the destination.
+ */
+static int cmd_retrieve(sfcc_client* c, const char* manifest,
+                        const char* out_path, const sfcc_retrieve_options* o){
+  sfcc_retrieve_result r;
+  sfcc_status st = sfcc_retrieve(c, manifest, out_path, o, &r);
+  if(st != SFCC_OK){
+    return report(c, st);
+  }
+  if(!g_quiet){
+    printf("retrieved %s (%s, %ld bytes)\n", out_path,
+           r.status ? r.status : "Succeeded", r.bytes);
+  }
+  sfcc_retrieve_result_free(&r);
+  return 0;
+}
+
 static int cmd_versions(sfcc_client* c){
   char* body = NULL;
   sfcc_status rc = sfcc_list_versions(c, &body);
@@ -1141,6 +1182,11 @@ int main(int argc, char** argv){
 
   /* describe options */
   describe_opts dopts_desc = { .json = 0, .field_filter = NULL };
+
+  /* retrieve options */
+  const char* retrieve_out = "metadata.zip";
+  sfcc_retrieve_options ropts;
+  sfcc_retrieve_options_defaults(&ropts);
 
   /* rest options */
   const char* rest_method = NULL;
@@ -1241,6 +1287,26 @@ int main(int argc, char** argv){
       insecure = 1;
     }else if(strcmp(name, "--zip") == 0){
       NEEDS_VALUE(zip_path);
+    }else if(strcmp(name, "--out") == 0){
+      NEEDS_VALUE(retrieve_out);
+    }else if(strcmp(name, "--retrieve-poll-interval") == 0){
+      const char* v = NULL;
+      NEEDS_VALUE(v);
+      ropts.poll_interval_s = strtol(v, NULL, 10);
+      if(ropts.poll_interval_s <= 0){
+        fprintf(stderr, SFCC_PROGNAME
+                        ": --retrieve-poll-interval must be positive\n");
+        return 2;
+      }
+    }else if(strcmp(name, "--retrieve-timeout") == 0){
+      const char* v = NULL;
+      NEEDS_VALUE(v);
+      ropts.timeout_s = strtol(v, NULL, 10);
+      if(ropts.timeout_s <= 0){
+        fprintf(stderr, SFCC_PROGNAME
+                        ": --retrieve-timeout must be positive\n");
+        return 2;
+      }
     }else if(strcmp(name, "--json") == 0){
       dopts_desc.json = 1;
     }else if(strcmp(name, "--field") == 0){
@@ -1437,6 +1503,14 @@ int main(int argc, char** argv){
         .headers = hdrs,
       };
       rc = cmd_rest(c, args[0], &ra);
+    }
+  }else if(strcmp(cmd, "retrieve") == 0){
+    if(nargs != 1){
+      fprintf(stderr, SFCC_PROGNAME ": retrieve needs exactly one package.xml\n"
+                  "  e.g. sfcc retrieve package.xml --out build/metadata.zip\n");
+      rc = 2;
+    }else{
+      rc = cmd_retrieve(c, args[0], retrieve_out, &ropts);
     }
   }else if(strcmp(cmd, "versions") == 0){
     rc = cmd_versions(c);
