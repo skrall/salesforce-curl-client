@@ -210,20 +210,38 @@ static void build_envelope(const char* api_version, const char* session_id,
                            const char* unpackaged, sfcc_buf* out){
   const char* bare = bare_version(api_version);
 
+  /*
+   * Shape taken from the Metadata API WSDL rather than guessed:
+   *
+   *   <xsd:element name="retrieve">
+   *     <xsd:sequence>
+   *       <xsd:element name="retrieveRequest" type="tns:RetrieveRequest"/>
+   *
+   *   <xsd:complexType name="RetrieveRequest">
+   *     <xsd:sequence>
+   *       apiVersion        xsd:double       required
+   *       packageNames      string           optional, repeated
+   *       singlePackage     xsd:boolean      REQUIRED -- minOccurs defaults to 1
+   *       specificFiles     string           optional, repeated
+   *       unpackaged        tns:Package      optional
+   *
+   * Three things this version got wrong, each of which the org reported as
+   * "Element {...}unpackaged invalid at this location":
+   *
+   *   - the retrieveRequest wrapper, so the fields were one level too high;
+   *   - singlePackage omitted, because xsd defaults minOccurs to 1 and this
+   *     reads as optional until you check;
+   *   - sequence order, which is a sequence and not a choice.
+   *
+   * No LimitInfoHeader either: that is a partner-API header. The metadata WSDL
+   * declares AllOrNoneHeader, DebuggingHeader and SessionHeader, and nothing
+   * else.
+   */
   sfcc_buf_puts(out,
     "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
     "<env:Envelope xmlns:env=\"http://schemas.xmlsoap.org/soap/envelope/\"\n"
     "              xmlns=\"http://soap.sforce.com/2006/04/metadata\">\n"
     "  <env:Header>\n"
-    "    <LimitInfoHeader>\n"
-    "      <limitInfo>\n"
-    "        <apiVersion>");
-  sfcc_buf_puts(out, bare);
-  sfcc_buf_puts(out,
-    "</apiVersion>\n"
-    "        <maxQueryLength>20000</maxQueryLength>\n"
-    "      </limitInfo>\n"
-    "    </LimitInfoHeader>\n"
     "    <SessionHeader>\n"
     "      <sessionId>");
   /*
@@ -239,14 +257,17 @@ static void build_envelope(const char* api_version, const char* session_id,
     "  </env:Header>\n"
     "  <env:Body>\n"
     "    <retrieve>\n"
-    "      <apiVersion>");
+    "      <retrieveRequest>\n"
+    "        <apiVersion>");
   sfcc_buf_puts(out, bare);
   sfcc_buf_puts(out,
     "</apiVersion>\n"
-    "      <unpackaged>");
+    "        <singlePackage>false</singlePackage>\n"
+    "        <unpackaged>");
   sfcc_buf_puts(out, unpackaged);
   sfcc_buf_puts(out,
     "</unpackaged>\n"
+    "      </retrieveRequest>\n"
     "    </retrieve>\n"
     "  </env:Body>\n"
     "</env:Envelope>\n");

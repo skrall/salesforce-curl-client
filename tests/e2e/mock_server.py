@@ -360,15 +360,71 @@ class Handler(BaseHTTPRequestHandler):
         raw = (self.headers.get("SOAPAction") or "").strip().strip('"')
         return raw
 
-    def _soap_guard(self):
-        """Reject the request unless it looks like the Metadata SOAP binding
-        expects: an empty SOAPAction, and a body element naming the operation."""
+    def _soap_guard(self, body=""):
+        """Reject the request unless it matches the Metadata WSDL.
+
+        This is the part that matters. The previous three request-side bugs all
+        reached a real org because the mock accepted any well-formed-looking
+        envelope: an unprefixed API version, a named SOAPAction, and a body with
+        the fields one level too high and a required element missing. Each was
+        reported by Salesforce as the same opaque "invalid at this location".
+
+        So the mock now checks what the WSDL declares, and answers with the
+        org's own wording:
+
+            <retrieve> contains exactly one <retrieveRequest>, and
+            RetrieveRequest is a sequence of apiVersion, packageNames?,
+            singlePackage, specificFiles?, unpackaged?
+
+        singlePackage is required -- xsd minOccurs defaults to 1, which is easy
+        to read as optional until you look.
+        """
         if self._soap_action():
             self._soap_fault(
                 "soapenv:Client",
                 "Unexpected SOAPAction %r for the Metadata binding: it is "
                 "dispatched on the body element and must be empty"
                 % self._soap_action())
+            return True
+
+        # checkRetrieveStatus is a GET with no body, so there is nothing to
+        # check beyond the action. Only the retrieve POST carries an envelope.
+        if not body:
+            return False
+
+        if "<retrieve>" not in body:
+            self._soap_fault("soapenv:Client",
+                             "Element {...}retrieve invalid at this location")
+            return True
+
+        if "<retrieveRequest>" not in body:
+            self._soap_fault(
+                "soapenv:Client",
+                "Element {...}retrieveRequest invalid at this location in type "
+                "retrieve")
+            return True
+
+        # The sequence, in order. Checked with indexes rather than regex so a
+        # missing element is caught as "after the wrong point" rather than
+        # passing by accident.
+        order = ["<apiVersion>", "<singlePackage>", "<unpackaged>"]
+        at = -1
+        for tag in order:
+            nxt = body.find(tag, at + 1)
+            if nxt < 0:
+                missing = tag.strip("<>")
+                self._soap_fault(
+                    "soapenv:Client",
+                    "Element {...}%s invalid at this location in type "
+                    "RetrieveRequest" % missing)
+                return True
+            at = nxt
+
+        if "LimitInfoHeader" in body:
+            # A partner-API header; the metadata WSDL does not declare it.
+            self._soap_fault("soapenv:Client",
+                             "Element {...}LimitInfoHeader invalid at this "
+                             "location")
             return True
         return False
 
@@ -389,8 +445,17 @@ class Handler(BaseHTTPRequestHandler):
         return True
 
     def _soap_fault(self, code, text):
-        return self._send_raw(500, SOAP_FAULT.replace("sf:INVALID_SESSION_ID", code)
-                              .encode("utf-8"), "text/xml")
+        """A SOAP fault in the org's own shape.
+
+        Both the code and the string are substituted. Passing a distinct message
+        and having it ignored made every fault look like a session problem,
+        which sent me looking in entirely the wrong place.
+        """
+        body = (SOAP_FAULT
+                .replace("sf:INVALID_SESSION_ID", code)
+                .replace("Invalid Session ID found in SessionHeader: "
+                         "expired or invalid", text))
+        return self._send_raw(500, body.encode("utf-8"), "text/xml")
 
     # -- GET ----------------------------------------------------------------
 
@@ -402,7 +467,7 @@ class Handler(BaseHTTPRequestHandler):
         q = parse_qs(u.query)
 
         if self._soap():
-            if self._soap_guard():
+            if self._soap_guard(""):
                 return
             rid = "0Af1B000000RetrieveAAA"
             if rid == "unknown":
@@ -553,9 +618,9 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
 
         if self._soap() and "<retrieve>" in raw.decode("utf-8", "replace"):
-            if self._soap_guard():
-                return
             body = raw.decode("utf-8", "replace")
+            if self._soap_guard(body):
+                return
             with STATE.lock:
                 STATE.soap_bodies.append(body)
 
