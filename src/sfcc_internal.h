@@ -141,6 +141,7 @@ typedef enum {
   SFCC_CACHE_ERR_NOT_OURS = -6,        /* no SFCCENC1 magic               */
   SFCC_CACHE_ERR_BAD_HEADER = -7,      /* ours, but corrupted or newer    */
   SFCC_CACHE_ERR_KEY_MISMATCH = -8,    /* tag check failed                */
+  SFCC_CACHE_ERR_BACKEND = -9,         /* a primitive failed; see stderr  */
 } sfcc_cache_rc;
 
 const char* sfcc_cache_passphrase(void);

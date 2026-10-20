@@ -383,6 +383,14 @@ static int backend_gcm_decrypt(const unsigned char* key, size_t key_len,
  * frame at all; less than it and the answer is "corrupt" before any field is
  * read: magic, version, iters, salt, nonce, tag, and a minimum ciphertext. */
 #define SFCC_CACHE_HEADER_LEN 13
+/* Names the failing stage on stderr, from the framing layer, which is the
+ * one place that sees every backend and can speak about it in terms a
+ * broken platform's CI log can carry. Kept terse: it fires only when a
+ * primitive fails, which in a correct build never happens. */
+static void stage_fail(const char* stage){
+  fprintf(stderr, "sfcc cache crypto: %s stage failed\n", stage);
+}
+
 static size_t frame_fixed_len(void){
   return (size_t)SFCC_CACHE_MAGIC_LEN          /* magic                     */
        + 1                                     /* version                   */
@@ -444,21 +452,27 @@ int sfcc_cache_wrap(const char* passphrase,
   header[SFCC_CACHE_MAGIC_LEN] = SFCC_CACHE_FORMAT_VERSION;
   put_u32le(header + SFCC_CACHE_MAGIC_LEN + 1, iters);
 
+  /* Backend stages are named on stderr when they fail. A machine where a
+   * primitive refuses outright is one CI log's worth of not-reproducible
+   * otherwise, and the stage name is the only difference between "backend"
+   * and a guess. Genuinely allocation-sized failures keep OOM. */
   int rc = SFCC_CACHE_OK;
   if(backend_random(salt, sizeof(salt)) != 0){
-    rc = SFCC_CACHE_ERR_OUT_OF_MEMORY;
+    stage_fail("RNG");
+    rc = SFCC_CACHE_ERR_BACKEND;
   }else if(backend_random(nonce, sizeof(nonce)) != 0){
-    rc = SFCC_CACHE_ERR_OUT_OF_MEMORY;
+    stage_fail("RNG");
+    rc = SFCC_CACHE_ERR_BACKEND;
   }else if(backend_derive_key(passphrase, pass_len, salt, sizeof(salt),
                               iters, key, sizeof(key)) != 0){
-    rc = SFCC_CACHE_ERR_OUT_OF_MEMORY;  /* backend failure, not memory; but
-                                         * the cache layer treats every
-                                         * failure here the same way */
+    stage_fail("KDF");
+    rc = SFCC_CACHE_ERR_BACKEND;
   }else if(backend_gcm_encrypt(key, sizeof(key), nonce, sizeof(nonce),
                                header, sizeof(header),
                                plaintext, pt_len, ciphertext, tag,
                                sizeof(tag)) != 0){
-    rc = SFCC_CACHE_ERR_OUT_OF_MEMORY;
+    stage_fail("encrypt");
+    rc = SFCC_CACHE_ERR_BACKEND;
   }else if(sfcc_buf_append(out, (const char*)header, sizeof(header)) ||
            sfcc_buf_append(out, (const char*)salt, sizeof(salt)) ||
            sfcc_buf_append(out, (const char*)nonce, sizeof(nonce)) ||
@@ -530,7 +544,8 @@ int sfcc_cache_unwrap(const char* passphrase,
   int rc = SFCC_CACHE_OK;
   if(backend_derive_key(passphrase, pass_len, salt, SFCC_CACHE_SALT_LEN,
                         iters, key, sizeof(key)) != 0){
-    rc = SFCC_CACHE_ERR_OUT_OF_MEMORY;
+    stage_fail("KDF");
+    rc = SFCC_CACHE_ERR_BACKEND;
   }else if(backend_gcm_decrypt(key, sizeof(key), nonce, SFCC_CACHE_NONCE_LEN,
                                aad, SFCC_CACHE_HEADER_LEN, body, body_len,
                                plaintext, tag, SFCC_CACHE_TAG_LEN) != 0){
