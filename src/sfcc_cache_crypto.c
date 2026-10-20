@@ -33,8 +33,11 @@
  * different key per file and mean the bytes are not stable until the next
  * token refresh rewrites them.
  *
- * Implementation note: every platform ships the primitives, so Windows uses
- * CNG and macOS uses CommonCrypto and pulls in nothing new. POSIX has no
+ * Implementation note: every platform ships the primitives, so this pulls in
+ * nothing third-party -- Windows uses CNG off bcrypt.lib, and macOS pairs a
+ * CommonCrypto KDF and RNG with the raw GCM primitive from corecrypto, whose
+ * headers the SDK ships (CommonCrypto's own GCM interface has left the public
+ * headers; see the note at the GCM functions). POSIX has no
  * standard equivalent, so Linux links libcrypto -- which is almost always
  * already loaded here, because libcurl needs TLS. The cost is a build-time
  * header requirement, not a new runtime package. The backend is chosen in
@@ -268,8 +271,8 @@ static int backend_gcm_encrypt(const unsigned char* key, size_t key_len,
   info.cbNonce = (ULONG)nonce_len;
   info.pbTag = tag;
   info.cbTag = (ULONG)tag_len;
-  info.pbAAD = (PUCHAR)aad;
-  info.cbAAD = (ULONG)aad_len;
+  info.pbAuthData = (PUCHAR)aad;
+  info.cbAuthData = (ULONG)aad_len;
   ULONG done = 0;
   int rc = -1;
   /* Both the struct and the trailing IV parameters name the nonce. They are
@@ -301,8 +304,8 @@ static int backend_gcm_decrypt(const unsigned char* key, size_t key_len,
   info.cbNonce = (ULONG)nonce_len;
   info.pbTag = (PUCHAR)tag;      /* expected tag: BCryptDecrypt verifies */
   info.cbTag = (ULONG)tag_len;
-  info.pbAAD = (PUCHAR)aad;
-  info.cbAAD = (ULONG)aad_len;
+  info.pbAuthData = (PUCHAR)aad;
+  info.cbAuthData = (ULONG)aad_len;
   ULONG done = 0;
   int rc = -1;
   if(backend_gcm_open(&hAlg, &hKey, key, key_len) == 0 &&
@@ -319,9 +322,9 @@ static int backend_gcm_decrypt(const unsigned char* key, size_t key_len,
 
 #elif defined(SFCC_CRYPTO_BACKEND_CC)
 
-#include <CommonCrypto/CommonCryptor.h>
 #include <CommonCrypto/CommonKeyDerivation.h>
 #include <CommonCrypto/CommonRandom.h>
+#include <corecrypto/ccmode.h>
 
 int sfcc_cache_crypto_available(void){
   return 1;
@@ -341,64 +344,31 @@ static int backend_derive_key(const char* pass, size_t pass_len,
 }
 
 /*
- * CommonCrypto's GCM interface predates the one-shot interface that replaced
- * it and is marked deprecated, which under -Werror would end this feature in
- * one line. There is no supported non-deprecated C-level GCM on macOS that
- * does not pull in another framework, and the deprecation describes an
- * interface preference rather than a defect in the primitive. So the warning
- * is deliberately suppressed around exactly this block, and CI is the place
- * that gets to say whether the suppression still compiles against the SDK of
- * the day.
+ * GCM on macOS comes from corecrypto, whose headers the SDK ships, because
+ * CommonCrypto's own GCM interface was pulled out of the public headers -- and
+ * then out of the SDK entirely under -Werror, as this PR's first CI run
+ * demonstrated to the byte: "use of undeclared identifier 'kCCModeGCM'".
+ * Apple's documented successor is the ccgcm family in <corecrypto/ccmode.h>,
+ * which reads as exactly one decision here rather than three -- the mode
+ * descriptor is a pointer, the one-shot handles AAD-ordering and tag
+ * comparison itself, and what CommonCrypto still ships (PBKDF2 and the RNG)
+ * stays above. The header is labelled by Apple as an implementation detail;
+ * it is also the only supported C-level GCM on the platform, which is the
+ * tension every project in this position lives with.
  */
-#if defined(__clang__)
-#pragma clang diagnostic push
-#pragma clang diagnostic ignored "-Wdeprecated-declarations"
-#endif
-
-static int backend_gcm_crypt(int decrypt,
-                             const unsigned char* key, size_t key_len,
-                             const unsigned char* nonce, size_t nonce_len,
-                             const unsigned char* aad, size_t aad_len,
-                             const unsigned char* in, size_t in_len,
-                             unsigned char* out, unsigned char* tag,
-                             size_t tag_len){
-  CCCryptorRef cryptor = NULL;
-  CCCryptorStatus st = CCCryptorCreateWithMode(
-      decrypt ? kCCDecrypt : kCCEncrypt, kCCModeGCM, kCCAlgorithmAES,
-      ccNoPadding, NULL /* GCM takes the IV through the GCM calls */,
-      key, key_len, NULL, 0, 0 /* default rounds */, 0, &cryptor);
-  if(st != kCCSuccess){
-    return -1;
-  }
-  size_t moved = 0;
-  int rc = -1;
-  /* AAD, then payload, then the tag. The order does not change the GCM
-   * result but keeps the two directions reading identically. */
-  if(CCCryptorGCMAddIV(cryptor, nonce, nonce_len) == kCCSuccess &&
-     (aad_len == 0 ||
-      CCCryptorGCMaddCleartext(cryptor, aad, aad_len) == kCCSuccess) &&
-     CCCryptorGCMaddCiphertext(cryptor, in, in_len, out, &moved) ==
-         kCCSuccess &&
-     moved == in_len &&
-     CCCryptorGCMfinalize(cryptor, tag, tag_len) == kCCSuccess){
-    rc = 0;
-  }
-  CCCryptorRelease(cryptor);
-  return rc;
-}
-
-#if defined(__clang__)
-#pragma clang diagnostic pop
-#endif
-
 static int backend_gcm_encrypt(const unsigned char* key, size_t key_len,
                                const unsigned char* nonce, size_t nonce_len,
                                const unsigned char* aad, size_t aad_len,
                                const unsigned char* plaintext, size_t pt_len,
                                unsigned char* ciphertext, unsigned char* tag,
                                size_t tag_len){
-  return backend_gcm_crypt(0, key, key_len, nonce, nonce_len, aad, aad_len,
-                           plaintext, pt_len, ciphertext, tag, tag_len);
+  const struct ccmode_gcm* mode = ccaes_gcm_encrypt_mode();
+  if(mode == NULL){
+    return -1;
+  }
+  return ccgcm_one_shot(mode, key_len, key, nonce_len, nonce,
+                        aad_len, aad, pt_len, plaintext, ciphertext,
+                        tag_len, tag) == 0 ? 0 : -1;
 }
 
 static int backend_gcm_decrypt(const unsigned char* key, size_t key_len,
@@ -407,22 +377,19 @@ static int backend_gcm_decrypt(const unsigned char* key, size_t key_len,
                                const unsigned char* ciphertext, size_t ct_len,
                                unsigned char* plaintext, const unsigned char* tag,
                                size_t tag_len){
-  /* Verification is comparison in CommonCrypto: finalize computes the tag
-   * for this input in either direction, and "did it verify" is the match
-   * checked here, in constant time the compiler will still spot-check. */
-  unsigned char computed[SFCC_CACHE_TAG_LEN];
-  if(backend_gcm_crypt(1, key, key_len, nonce, nonce_len, aad, aad_len,
-                       ciphertext, ct_len, plaintext, computed,
-                       sizeof(computed))){
-    sfcc_cache_zero(computed, sizeof(computed));
+  const struct ccmode_gcm* mode = ccaes_gcm_decrypt_mode();
+  if(mode == NULL){
     return -1;
   }
-  unsigned char diff = 0;
-  for(size_t i = 0; i < SFCC_CACHE_TAG_LEN; i++){
-    diff |= (unsigned char)(computed[i] ^ tag[i]);
-  }
-  sfcc_cache_zero(computed, sizeof(computed));
-  return diff == 0 ? 0 : -1;
+  /* The tag is an input and an output on the decrypt path: the one-shot
+   * writes the tag it computed back into the buffer it was given, so the
+   * expected tag is compared through a writable copy. The return code is
+   * the verification; no comparison of our own is needed after it. */
+  unsigned char given[SFCC_CACHE_TAG_LEN];
+  memcpy(given, tag, tag_len);
+  return ccgcm_one_shot(mode, key_len, key, nonce_len, nonce,
+                        aad_len, aad, ct_len, ciphertext, plaintext,
+                        tag_len, given) == 0 ? 0 : -1;
 }
 
 #else /* no backend compiled in */

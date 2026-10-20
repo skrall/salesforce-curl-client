@@ -180,10 +180,12 @@ if(WIN32)
   # are not involved here despite the name overlap with the old Crypt* API.
   target_link_libraries(sfcc PUBLIC bcrypt)
 elseif(APPLE)
-  set(SFCC_CACHE_CRYPTO_BACKEND "CommonCrypto")
+  set(SFCC_CACHE_CRYPTO_BACKEND "corecrypto/CommonCrypto")
   target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_CC)
-  # CommonCrypto lives in libSystem, so there is no explicit link; see the
-  # deprecation note in sfcc_cache_crypto.c about the GCM interface.
+  # CommonCrypto supplies KDF and RNG from libSystem. The raw GCM primitive
+  # lives in corecrypto, a separate dylib the SDK headers describe -- see the
+  # note in sfcc_cache_crypto.c about why not CommonCrypto's own GCM calls.
+  target_link_libraries(sfcc PUBLIC corecrypto)
 else()
   find_package(OpenSSL QUIET)
   if(OpenSSL_FOUND)
