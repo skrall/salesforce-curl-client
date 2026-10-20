@@ -41,11 +41,14 @@ apt install libcurl4-openssl-dev build-essential cmake
 
 ### macOS
 
-libcurl is present but headers often are not:
+libcurl is present but headers often are not, and the cache-encryption
+backend needs libcrypto headers that are keg-only too:
 
 ```sh
-brew install curl cmake
-cmake -S . -B build -DCMAKE_PREFIX_PATH="$(brew --prefix curl)"
+brew install curl cmake openssl@3
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix curl)" \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 ```
 
 ### Windows
@@ -145,6 +148,8 @@ Sandboxes use `--login-url https://test.salesforce.com`.
 | `SFCC_ACCESS_TOKEN` | Pre-minted access token |
 | `SFCC_API_VERSION` | API version |
 | `SFCC_TOKEN_CACHE` | Token cache path |
+| `SFCC_CACHE_PASSPHRASE` | Encrypt the token cache at rest |
+| `SFCC_CACHE_KDF_ITERS` | Cache KDF iterations (default 600000) |
 
 ### Keeping dependencies current
 
@@ -578,6 +583,32 @@ deliberately. Each is covered by a test.
   which means any other local account can read it and use the org. There is no
   equivalent on Windows, where access is governed by the file's ACL instead.
 
+* **`SFCC_CACHE_PASSPHRASE` encrypts the token cache at rest.** With it set,
+  the cache is written as an `SFCCENC1` frame — AES-256-GCM over the record,
+  the key from PBKDF2-HMAC-SHA256 — instead of JSON. Like everything secret,
+  the passphrase is read from the environment only; there is no flag, because
+  command lines are visible to other processes.
+
+  The scope, said plainly: this protects the file when it *leaves the
+  machine* — sync folders, backups, disk images, a copied home directory. It
+  does not protect it from anything running as this user, who can read the
+  token while the client is using it no matter what mode the file has. A key
+  stored next to the ciphertext would protect nothing, so the passphrase is
+  the key's only source — never a file, never an option.
+
+  The behaviours worth knowing: a plaintext cache is rewritten encrypted the
+  next time it is read and found current; a wrong passphrase — which is
+  indistinguishable from corruption, that being what the tag exists to
+  enforce — fails the command with the variable named and *leaves the file
+  alone*, because the same passphrase typed correctly later still opens it;
+  so does a cache with no passphrase in the environment. The KDF default is
+  600000 iterations and is paid every time the cache is read;
+  `SFCC_CACHE_KDF_ITERS` lowers it per machine, and the chosen count is
+  recorded in the file header, so a lowered one is visible, not secret.
+  Windows gets the crypto from the OS (CNG); on Linux and macOS it links
+  libcrypto — present wherever libcurl is on Linux, and `brew install
+  openssl@3` on macOS, so no new runtime package in practice.
+
 * **Redirects are not followed.** Following one would replay the
   `Authorization` header at whatever host the `Location` points to.
 
@@ -685,6 +716,7 @@ src/sfcc_util.c       buffers, strings, percent-encoding, paths
 src/sfcc_json.c       JSON helpers and error unpacking
 src/sfcc_http.c       libcurl: build, send, collect, report
 src/sfcc_auth.c       OAuth and token caching
+src/sfcc_cache_crypto.c  cache encryption at rest, per-platform backends
 src/sfcc_client.c     config, URL building, the sObject operations
 src/main.c            command-line front end
 third_party/cjson/    vendored, pinned at v1.7.19 (MIT)

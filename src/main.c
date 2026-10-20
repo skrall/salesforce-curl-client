@@ -169,7 +169,8 @@ static void usage(FILE* out){
 "\n"
 "  -h, --help                  this text\n"
 "  -V, --version               version information\n"
-"\n"
+"\n", out);
+  fputs(
 "Environment:\n"
 "  SFCC_CLIENT_ID              connected app consumer key      (required)\n"
 "  SFCC_CLIENT_SECRET          connected app consumer secret  (required)\n"
@@ -178,6 +179,8 @@ static void usage(FILE* out){
 "  SFCC_ACCESS_TOKEN           pre-minted access token\n"
 "  SFCC_API_VERSION            API version\n"
 "  SFCC_TOKEN_CACHE            token cache path\n"
+"  SFCC_CACHE_PASSPHRASE       encrypts the token cache at rest\n"
+"  SFCC_CACHE_KDF_ITERS        cache KDF iterations (default 600000)\n"
 "\n"
 "The client secret is read from the environment only, never from an argument,\n"
 "because command lines are readable by any process running as this user.\n"

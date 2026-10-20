@@ -601,6 +601,413 @@ static void test_zip_guard(void){
   sfcc_client_free(c);
 }
 
+/* Environment helpers, because the passphrase and its KDF override are
+ * configuration-discovery paths that getenv reads. setenv is POSIX-only;
+ * MSVC exposes _putenv_s in stdlib.h, and an empty value removes the entry. */
+static void env_set(const char* var, const char* value){
+#ifdef _WIN32
+  _putenv_s(var, value);
+#else
+  setenv(var, value, 1);
+#endif
+}
+
+static void env_clear(const char* var){
+#ifdef _WIN32
+  _putenv_s(var, "");
+#else
+  unsetenv(var);
+#endif
+}
+
+/*
+ * The encrypted cache frame, and what the auth layer does with it.
+ *
+ * Everything here runs on whatever backend the build selected, which is the
+ * point: the same test list exercises OpenSSL or CNG purely by
+ * virtue of being built on the platform, and a Windows run of these checks
+ * is real coverage of BCrypt's GCM rather than a placeholder.
+ */
+static void test_cache_crypto(void){
+  GROUP("cache crypto");
+
+  /* Whatever the developer has exported must not reach these tests. */
+  env_clear("SFCC_CACHE_PASSPHRASE");
+  env_clear("SFCC_CACHE_KDF_ITERS");
+
+  if(!sfcc_cache_crypto_available()){
+    /* A backend-less build is legitimate; the contract is only that wrap
+     * says so instead of writing ciphertext it cannot open again. */
+    sfcc_buf out;
+    sfcc_buf_init(&out);
+    check(sfcc_cache_wrap("pw", (const unsigned char*)"x", 1,
+                          SFCC_CACHE_KDF_MINIMUM, &out)
+              == SFCC_CACHE_ERR_CRYPTO_UNAVAILABLE,
+          "a build with no backend refuses to wrap rather than faking it");
+    sfcc_buf_free(&out);
+    check(sfcc_cache_passphrase() == NULL,
+          "no passphrase in the environment reads as unset");
+    return;
+  }
+
+  static const unsigned char PAYLOAD[] = "0123456789abcdefghijklmnopqrstuvwxyz";
+  const size_t PAYLOAD_LEN = sizeof(PAYLOAD) - 1;
+
+  /* -- frame round trip ---------------------------------------------------- */
+  sfcc_buf frame;
+  sfcc_buf_init(&frame);
+  int w = sfcc_cache_wrap("key-one", PAYLOAD, PAYLOAD_LEN,
+                          SFCC_CACHE_KDF_MINIMUM, &frame);
+  if(w != SFCC_CACHE_OK){
+    /* A backend that will not run is the one bug this platform can hide
+     * from Linux entirely; the code is the only clue a CI log will carry. */
+    fprintf(stderr, "  diag: wrap rc=%d\n", w);
+  }
+  check(w == SFCC_CACHE_OK, "wrap succeeds");
+  check(frame.len == 0 || frame.data != NULL,
+        "a failed wrap leaves no half-buffer behind");
+  if(frame.len != (size_t)(SFCC_CACHE_MAGIC_LEN  /* magic            */
+                          + 1                    /* version          */
+                          + 4                    /* iters            */
+                          + SFCC_CACHE_SALT_LEN
+                          + SFCC_CACHE_NONCE_LEN
+                          + PAYLOAD_LEN
+                          + SFCC_CACHE_TAG_LEN)){
+    fprintf(stderr, "  diag: frame len=%d, want %d\n", (int)frame.len,
+            (int)(SFCC_CACHE_MAGIC_LEN + 5 + SFCC_CACHE_SALT_LEN +
+                  SFCC_CACHE_NONCE_LEN + PAYLOAD_LEN + SFCC_CACHE_TAG_LEN));
+  }
+  check(frame.len == (size_t)(SFCC_CACHE_MAGIC_LEN  /* magic            */
+                            + 1                     /* version          */
+                            + 4                     /* iters            */
+                            + SFCC_CACHE_SALT_LEN
+                            + SFCC_CACHE_NONCE_LEN
+                            + PAYLOAD_LEN
+                            + SFCC_CACHE_TAG_LEN),
+        "frame length is header plus ciphertext plus tag");
+  if(frame.data == NULL){
+    /* Everything past this point reads the frame; without one, report the
+     * root cause and stop before a null-range memcmp says more. */
+    fprintf(stderr, "  no frame to test; skipping the rest of the group\n");
+    env_clear("SFCC_CACHE_PASSPHRASE");
+    env_clear("SFCC_CACHE_KDF_ITERS");
+    return;
+  }
+  check(memcmp(frame.data, SFCC_CACHE_MAGIC, SFCC_CACHE_MAGIC_LEN) == 0,
+        "the frame opens with the magic");
+
+  sfcc_buf plain;
+  sfcc_buf_init(&plain);
+  check(sfcc_cache_unwrap("key-one", (const unsigned char*)frame.data,
+                          frame.len, &plain) == SFCC_CACHE_OK,
+        "unwrap succeeds with the passphrase that wrapped it");
+  check(plain.len == PAYLOAD_LEN &&
+            memcmp(plain.data, (const char*)PAYLOAD, PAYLOAD_LEN) == 0,
+        "and the payload comes back byte for byte");
+
+  /* Wrong passphrase must be a distinct rejection from "no passphrase", and
+   * neither may succeed or hang. */
+  sfcc_buf_free(&plain);
+  sfcc_buf_init(&plain);
+  check(sfcc_cache_unwrap("wrong", (const unsigned char*)frame.data,
+                          frame.len, &plain) == SFCC_CACHE_ERR_KEY_MISMATCH,
+        "a wrong passphrase is a tag failure");
+  check(plain.len == 0, "and no plaintext leaked into the buffer");
+  check(sfcc_cache_unwrap(NULL, (const unsigned char*)frame.data, frame.len,
+                          &plain) == SFCC_CACHE_ERR_NO_PASSPHRASE,
+        "a missing passphrase is its own answer");
+
+  /* Same passphrase, same payload: the bytes still differ, because salt and
+   * nonce are drawn fresh per save. A frame that is byte-predictable from
+   * its input would be a nonce-reuse report waiting to happen. */
+  sfcc_buf frame2;
+  sfcc_buf_init(&frame2);
+  check(sfcc_cache_wrap("key-one", PAYLOAD, PAYLOAD_LEN,
+                        SFCC_CACHE_KDF_MINIMUM, &frame2) == SFCC_CACHE_OK,
+        "second wrap succeeds");
+  check(frame2.len == frame.len &&
+            memcmp(frame2.data, frame.data, frame.len) != 0,
+        "two frames of one payload differ (fresh salt and nonce)");
+  sfcc_buf_free(&frame2);
+
+  /* Tamper: flipping a ciphertext byte must fail the tag, never hand back
+   * near-miss plaintext. The magic is checked, and so is the version byte
+   * and the header as additional data -- editing the header breaks the
+   * integrity check rather than disabling it. */
+  sfcc_buf broken;
+  sfcc_buf_init(&broken);
+  sfcc_buf_append(&broken, frame.data, frame.len);
+  broken.data[60] = (char)(broken.data[60] ^ 0x01);
+  sfcc_buf_free(&plain);
+  sfcc_buf_init(&plain);
+  check(sfcc_cache_unwrap("key-one", (const unsigned char*)broken.data,
+                          broken.len, &plain) == SFCC_CACHE_ERR_KEY_MISMATCH,
+        "one flipped byte in the body is refused");
+
+  broken.data[0] = 'X';   /* destroy the magic outright */
+  check(sfcc_cache_unwrap("key-one", (const unsigned char*)broken.data,
+                          broken.len, &plain) == SFCC_CACHE_ERR_NOT_OURS,
+        "a frame that lost its magic is not ours");
+  broken.data[0] = 'S';
+  broken.data[8] = 9;     /* version byte: supported is 1 */
+  check(sfcc_cache_unwrap("key-one", (const unsigned char*)broken.data,
+                          broken.len, &plain) == SFCC_CACHE_ERR_BAD_HEADER,
+        "an unknown format version is corrupt, not decryptable");
+
+  /* The KDF floor and ceiling on the read side. These headers are checked
+   * before any derivation runs, so an absurdly high iteration count cannot
+   * turn "read a cache file" into minutes of work per command. */
+  broken.data[8] = 1;
+  broken.data[9]  = 0x64; broken.data[10] = 0x00;   /* iters = 100 */
+  broken.data[11] = 0x00; broken.data[12] = 0x00;
+  check(sfcc_cache_unwrap("key-one", (const unsigned char*)broken.data,
+                          broken.len, &plain) == SFCC_CACHE_ERR_BAD_HEADER,
+        "a header below the KDF floor is refused outright");
+  broken.data[9] = (char)0xFF; broken.data[10] = (char)0xFF;    /* iters = 0xFFFFFFFF */
+  broken.data[11] = (char)0xFF; broken.data[12] = (char)0xFF;
+  check(sfcc_cache_unwrap("key-one", (const unsigned char*)broken.data,
+                          broken.len, &plain) == SFCC_CACHE_ERR_BAD_HEADER,
+        "one above the ceiling too");
+
+  /* Shorter than any valid frame. */
+  check(sfcc_cache_unwrap("key-one", (const unsigned char*)"SFCCENC1",
+                          8, &plain) == SFCC_CACHE_ERR_BAD_HEADER,
+        "a truncated frame is corrupt");
+
+  /* -- wrap-side parameter bounds ------------------------------------------ */
+  sfcc_buf_init(&frame2);
+  check(sfcc_cache_wrap("key-one", PAYLOAD, PAYLOAD_LEN,
+                        SFCC_CACHE_KDF_MINIMUM - 1, &frame2)
+              == SFCC_CACHE_ERR_KDF_RANGE,
+        "iterations below the floor are refused at the entry point");
+  check(sfcc_cache_wrap("key-one", PAYLOAD, PAYLOAD_LEN,
+                        SFCC_CACHE_KDF_MAXIMUM + 1, &frame2)
+              == SFCC_CACHE_ERR_KDF_RANGE,
+        "and above the ceiling");
+  check(sfcc_cache_wrap("", PAYLOAD, PAYLOAD_LEN,
+                        SFCC_CACHE_KDF_MINIMUM, &frame2)
+              == SFCC_CACHE_ERR_NO_PASSPHRASE,
+        "an empty passphrase does not mean encrypt-anyway");
+  sfcc_buf_free(&frame2);
+  sfcc_buf_free(&broken);
+  sfcc_buf_free(&plain);
+  sfcc_buf_free(&frame);
+
+  /* -- through the auth layer ---------------------------------------------- */
+  /*
+   * Round trip through the real save/load pair. The assertions follow the
+   * on-disk bytes directly as well as the parsed record, because the file is
+   * what a backup or a sync job or another human would see.
+   */
+  char CACHE[] = "sfcc_test_enc_token.json";
+  remove(CACHE);
+  env_set("SFCC_CACHE_KDF_ITERS", "2000");
+  env_set("SFCC_CACHE_PASSPHRASE", "unit-game");
+
+  sfcc_config cfg;
+  sfcc_config_defaults(&cfg);
+  cfg.cache_path = CACHE;
+
+  sfcc_client* wm = sfcc_client_new(&cfg);
+  if(wm != NULL){
+    sfcc_strset(&wm->access_token, "tok-encrypted-secret");
+    sfcc_strset(&wm->instance_url, "http://127.0.0.1:65535/");
+    wm->token_expiry = time(NULL) + 900;
+    sfcc_auth_save_cache(wm);
+
+    /* On disk: frame bytes, with no token anywhere in the plaintext, and a
+     * header iteration count that honours the override. */
+    FILE* back = fopen(CACHE, "rb");
+    if(back != NULL){
+      sfcc_buf disk;
+      sfcc_buf_init(&disk);
+      char chunk[4096];
+      size_t got;
+      while((got = fread(chunk, 1, sizeof(chunk), back)) > 0){
+        sfcc_buf_append(&disk, chunk, got);
+      }
+      fclose(back);
+      check(disk.len >= SFCC_CACHE_MAGIC_LEN &&
+                memcmp(disk.data, SFCC_CACHE_MAGIC, SFCC_CACHE_MAGIC_LEN) == 0,
+            "the saved cache is an SFCCENC1 frame");
+      check(strstr(disk.data, "tok-encrypted-secret") == NULL,
+            "the token is nowhere readable in it");
+      check((unsigned char)disk.data[9] == 0xD0 &&
+            (unsigned char)disk.data[10] == 0x07 &&
+            disk.data[11] == 0 &&
+            disk.data[12] == 0,
+            "and the header records the 2000-iteration override");
+      sfcc_buf_free(&disk);
+    }else{
+      check(0, "the cache could be re-read from disk");
+    }
+
+    sfcc_client* r = sfcc_client_new(&cfg);
+    if(r != NULL){
+      check(sfcc_auth_load_cache(r) == SFCC_OK, "load succeeds");
+      check_str(r->access_token, "tok-encrypted-secret", "token came back");
+      check(r->instance_url != NULL &&
+                strcmp(r->instance_url, "http://127.0.0.1:65535") == 0,
+            "instance_url came back, stripped of its trailing slash");
+      check(sfcc_token_is_fresh(r), "and the expiry survived the trip");
+      sfcc_client_free(r);
+    }else{
+      check(0, "second client constructs");
+    }
+
+    /* Wrong passphrase: a hard, specific refusal, and an empty record --
+     * the failure the stale-token bug taught this codebase to mind. */
+    env_set("SFCC_CACHE_PASSPHRASE", "someone-else's");
+    sfcc_client* bad = sfcc_client_new(&cfg);
+    if(bad != NULL){
+      check(sfcc_auth_load_cache(bad) == SFCC_ERR_IO,
+            "a wrong passphrase fails the load");
+      check(bad->access_token == NULL && bad->instance_url == NULL,
+            "and adopts no partial record");
+      check(sfcc_last_error(bad) != NULL &&
+                strstr(sfcc_last_error(bad),
+                       "SFCC_CACHE_PASSPHRASE") != NULL,
+            "the message names the variable that fixes it");
+      sfcc_client_free(bad);
+    }
+
+    /* No passphrase, encrypted file: the same, with its own message. */
+    env_clear("SFCC_CACHE_PASSPHRASE");
+    sfcc_client* none = sfcc_client_new(&cfg);
+    if(none != NULL){
+      check(sfcc_auth_load_cache(none) == SFCC_ERR_IO,
+            "no passphrase fails the load");
+      check(sfcc_last_error(none) != NULL &&
+                strstr(sfcc_last_error(none), "set "
+                       "SFCC_CACHE_PASSPHRASE") != NULL,
+            "and says what to set");
+      sfcc_client_free(none);
+    }
+
+    /* -- migration ----------------------------------------------------------- */
+    /*
+     * A plaintext cache existing before the passphrase did must be upgraded
+     * on the next successful read, not parked until an eventual re-mint --
+     * with a still-fresh token that might never come. The expiry must come
+     * along unextended: migration is a rewrite, not a re-mint.
+     */
+    remove(CACHE);
+    FILE* seed = fopen(CACHE, "wb");
+    if(seed != NULL){
+      fputs("{\"access_token\":\"tok-migrated\","
+            "\"instance_url\":\"http://127.0.0.1:65535\","
+            "\"expires_at\":2000000000}", seed);
+      fclose(seed);
+      env_set("SFCC_CACHE_PASSPHRASE", "unit-game");
+      sfcc_client* mig = sfcc_client_new(&cfg);
+      if(mig != NULL){
+        check(sfcc_auth_load_cache(mig) == SFCC_OK,
+              "a plaintext cache still loads with a passphrase set");
+        check_str(mig->access_token, "tok-migrated", "its token was read");
+        /* The file on disk is a frame after that load. */
+        FILE* back2 = fopen(CACHE, "rb");
+        if(back2 != NULL){
+          sfcc_buf disk;
+          sfcc_buf_init(&disk);
+          char chunk[4096];
+          size_t got;
+          while((got = fread(chunk, 1, sizeof(chunk), back2)) > 0){
+            sfcc_buf_append(&disk, chunk, got);
+          }
+          fclose(back2);
+          check(memcmp(disk.data, SFCC_CACHE_MAGIC, SFCC_CACHE_MAGIC_LEN) == 0,
+                "and the cache was rewritten encrypted");
+          /* Unwrap by hand: the expiry inside must be the seeded 2033 one,
+           * not now + TTL, which would prove expiration drifted. */
+          sfcc_buf re;
+          sfcc_buf_init(&re);
+          if(sfcc_cache_unwrap("unit-game", (const unsigned char*)disk.data,
+                               disk.len, &re) == SFCC_CACHE_OK){
+            check(strstr(re.data, "2000000000") != NULL,
+                  "the original expiry, not a refreshed one, was preserved");
+          }else{
+            check(0, "the migrated frame decrypts");
+          }
+          sfcc_buf_free(&re);
+          sfcc_buf_free(&disk);
+        }else{
+          check(0, "cache re-readable after migration");
+        }
+        sfcc_client_free(mig);
+      }
+      /* Removing the passphrase also removes the migration: plaintext stays
+       * plaintext, which is what "no passphrase" means everywhere else. */
+      remove(CACHE);
+      seed = fopen(CACHE, "wb");
+      if(seed != NULL){
+        fputs("{\"access_token\":\"tok-plain\","
+              "\"instance_url\":\"http://127.0.0.1:65535\","
+              "\"expires_at\":2000000000}", seed);
+        fclose(seed);
+        env_clear("SFCC_CACHE_PASSPHRASE");
+        sfcc_client* stay = sfcc_client_new(&cfg);
+        if(stay != NULL){
+          check(sfcc_auth_load_cache(stay) == SFCC_OK,
+                "without a passphrase a plaintext cache loads");
+          FILE* back3 = fopen(CACHE, "rb");
+          if(back3 != NULL){
+            const int c0 = fgetc(back3);
+            fclose(back3);
+            check(c0 == '{', "and was left as plaintext JSON");
+          }
+          sfcc_client_free(stay);
+        }
+      }
+      env_set("SFCC_CACHE_PASSPHRASE", "unit-game");
+    }else{
+      check(0, "migration seed file writable");
+    }
+
+    /*
+     * The refusal is fatal at the auth gate, not a reason to re-mint over
+     * the file. This is the CLI's exact path -- gate, then ensure_auth --
+     * minus the process exit. Any hard failure must leave the file exactly
+     * alone: the correct passphrase is one corrected environment variable
+     * away, and deleting the frame here would take that away with it.
+     */
+    sfcc_auth_save_cache(wm);                      /* frame under the good phrase */
+    env_set("SFCC_CACHE_PASSPHRASE", "someone-else's");
+    sfcc_client* gate = sfcc_client_new(&cfg);
+    if(gate != NULL){
+      check(sfcc_authenticate(gate, NULL) == SFCC_ERR_IO,
+            "a refused cache fails the auth gate, not a silent re-mint");
+      FILE* back4 = fopen(CACHE, "rb");
+      if(back4 != NULL){
+        sfcc_buf disk;
+        sfcc_buf_init(&disk);
+        char chunk[4096];
+        size_t got;
+        while((got = fread(chunk, 1, sizeof(chunk), back4)) > 0){
+          sfcc_buf_append(&disk, chunk, got);
+        }
+        fclose(back4);
+        check(memcmp(disk.data, SFCC_CACHE_MAGIC, SFCC_CACHE_MAGIC_LEN) == 0,
+              "and the original frame survived");
+        sfcc_buf_free(&disk);
+      }else{
+        check(0, "the frame is still on disk after the refusal");
+      }
+      sfcc_client_free(gate);
+    }
+    env_set("SFCC_CACHE_PASSPHRASE", "unit-game");
+
+    remove(CACHE);
+    sfcc_client_free(wm);
+  }else{
+    check(0, "client constructs for the cache round trip");
+  }
+
+  /* Leave the environment as found, so a test ordering change cannot turn a
+   * leftover passphrase into somebody else's pass. */
+  env_clear("SFCC_CACHE_PASSPHRASE");
+  env_clear("SFCC_CACHE_KDF_ITERS");
+}
+
 /*
  * The generic passthrough's argument handling, all of which happens before any
  * network I/O -- so it is testable without a server.
@@ -684,6 +1091,7 @@ int main(void){
   test_url_building();
   test_auth_header();
   test_zip_guard();
+  test_cache_crypto();
   test_rest_args();
   test_body_limit();
   test_strings();

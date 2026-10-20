@@ -24,6 +24,7 @@
 
 #include "cJSON.h"
 
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -38,6 +39,10 @@
  * re-mint rather than push on a token that might be about to die. */
 #define SFCC_TOKEN_TTL 1800L   /* 30 minutes */
 #endif
+
+/* Defined below sfcc_auth_save_cache, which needs the prototype because the
+ * entry point is what callers use and it sits first. */
+static void save_cache_record(sfcc_client* c, time_t expires_at);
 
 int sfcc_token_is_fresh(const sfcc_client* c){
   if(c == NULL || c->access_token == NULL || c->token_expiry <= 0){
@@ -54,6 +59,38 @@ int sfcc_token_is_fresh(const sfcc_client* c){
 /* ------------------------------------------------------------------------ */
 /* Cache                                                                    */
 /* ------------------------------------------------------------------------ */
+
+/*
+ * Where the derived KDF iteration count comes from, when writing.
+ *
+ * The default tracks published PBKDF2 guidance; an override exists because
+ * the cost is paid on every command that reads the cache, and a machine the
+ * passphrase was chosen for may prefer a lower number. A value the parser
+ * cannot make sense of falls back to the default rather than to the floor --
+ * "SFCC_CACHE_KDF_ITERS=oops" should not silently mean 1000.
+ */
+static unsigned long kdf_iters_from_env(void){
+  const char* s = getenv("SFCC_CACHE_KDF_ITERS");
+  if(s == NULL || *s == '\0'){
+    return SFCC_CACHE_KDF_DEFAULT;
+  }
+  if(s[0] == '-' || s[0] == '+'){
+    return SFCC_CACHE_KDF_DEFAULT;
+  }
+  char* end = NULL;
+  errno = 0;
+  unsigned long v = strtoul(s, &end, 10);
+  if(end == s || errno == ERANGE || (end != NULL && *end != '\0')){
+    return SFCC_CACHE_KDF_DEFAULT;
+  }
+  if(v < SFCC_CACHE_KDF_MINIMUM){
+    v = SFCC_CACHE_KDF_MINIMUM;
+  }
+  if(v > SFCC_CACHE_KDF_MAXIMUM){
+    v = SFCC_CACHE_KDF_MAXIMUM;
+  }
+  return v;
+}
 
 sfcc_status sfcc_auth_load_cache(sfcc_client* c){
   if(c == NULL || c->no_cache || c->cache_path == NULL){
@@ -74,8 +111,65 @@ sfcc_status sfcc_auth_load_cache(sfcc_client* c){
   }
   fclose(f);
 
+  /*
+   * Encrypted frame or plaintext JSON? Deciding that from the first eight
+   * bytes, before any parsing, is what keeps the two diagnosable in their
+   * own terms. An SFCCENC1 frame is not "not valid JSON" to be reported as
+   * such, and a plaintext cache is not a frame that any passphrase could
+   * open. It also keeps decryption from ever running on an arbitrary file
+   * that merely happens to be bigger than one frame.
+   */
+  const int encrypted = b.len >= SFCC_CACHE_MAGIC_LEN &&
+                        memcmp(b.data, SFCC_CACHE_MAGIC,
+                               SFCC_CACHE_MAGIC_LEN) == 0;
+
+  const char* json = b.data;
+  size_t json_len = b.len;
+  sfcc_buf plain;
+  sfcc_buf_init(&plain);
+
   sfcc_status rc = SFCC_OK;
-  cJSON* root = cJSON_ParseWithLength(b.data ? b.data : "", b.len);
+  if(encrypted){
+    int u = sfcc_cache_unwrap(sfcc_cache_passphrase(),
+                              (const unsigned char*)b.data, b.len, &plain);
+    switch(u){
+      case SFCC_CACHE_OK:
+        json = plain.data;
+        json_len = plain.len;
+        break;
+      case SFCC_CACHE_ERR_NO_PASSPHRASE:
+        rc = sfcc_fail(c, SFCC_ERR_IO,
+                       "token cache at %s is encrypted; set "
+                       "SFCC_CACHE_PASSPHRASE to the value it was written "
+                       "with, or delete the file",
+                       c->cache_path);
+        break;
+      case SFCC_CACHE_ERR_KEY_MISMATCH:
+        rc = sfcc_fail(c, SFCC_ERR_IO,
+                       "token cache at %s could not be decrypted with the "
+                       "current SFCC_CACHE_PASSPHRASE -- wrong passphrase or "
+                       "a corrupt file; delete it to reset",
+                       c->cache_path);
+        break;
+      case SFCC_CACHE_ERR_BAD_HEADER:
+        rc = sfcc_fail(c, SFCC_ERR_IO,
+                       "token cache at %s has a damaged SFCCENC1 header; "
+                       "delete the file to reset", c->cache_path);
+        break;
+      case SFCC_CACHE_ERR_OUT_OF_MEMORY:
+        rc = sfcc_fail(c, SFCC_ERR_MEM, "out of memory reading %s",
+                       c->cache_path);
+        break;
+      default:
+        rc = sfcc_fail(c, SFCC_ERR_IO, "token cache at %s is unreadable",
+                       c->cache_path);
+        break;
+    }
+  }
+
+  cJSON* root = (rc == SFCC_OK)
+                  ? cJSON_ParseWithLength(json ? json : "", json_len)
+                  : NULL;
   if(root != NULL){
     const cJSON* tok = cJSON_GetObjectItemCaseSensitive(root, "access_token");
     const cJSON* inst = cJSON_GetObjectItemCaseSensitive(root, "instance_url");
@@ -108,18 +202,51 @@ sfcc_status sfcc_auth_load_cache(sfcc_client* c){
       }else{
         c->token_expiry = 0;   /* unknown age; treated as stale */
       }
+
+      /*
+       * Migration, in place. The moment a passphrase and a working backend
+       * exist, a plaintext cache is rewritten encrypted, so "I set the
+       * passphrase" takes effect on the next run rather than the next
+       * re-mint -- which might be weeks away, or never if the cache keeps
+       * being reused. Only a *usable* record migrates: refreshing a dead one
+       * is about to delete it anyway.
+       *
+       * The rewrite is idempotent, so a reader finding an already-encrypted
+       * file costs one string comparison and stops.
+       */
+      if(!encrypted && rc == SFCC_OK && sfcc_token_is_fresh(c) &&
+         sfcc_cache_passphrase() != NULL && sfcc_cache_crypto_available()){
+        save_cache_record(c, c->token_expiry);
+      }
     }
     cJSON_Delete(root);
-  }else{
+  }else if(!encrypted && rc == SFCC_OK){
     rc = sfcc_fail(c, SFCC_ERR_IO,
-                   "token cache at %s is not valid JSON; ignoring it "
-                   "(delete the file to reset)", c->cache_path);
+                   "token cache at %s is not valid JSON; delete the file to "
+                   "reset", c->cache_path);
   }
+
+  /* Erase before release -- both buffers can have held the plaintext token
+   * at one point or another in these paths. */
+  sfcc_cache_zero(b.data, b.len);
   sfcc_buf_free(&b);
+  sfcc_cache_zero(plain.data, plain.len);
+  sfcc_buf_free(&plain);
   return rc;
 }
 
 void sfcc_auth_save_cache(sfcc_client* c){
+  save_cache_record(c, time(NULL) + SFCC_TOKEN_TTL);
+}
+
+/*
+ * The record writer behind sfcc_auth_save_cache. expires_at is a parameter
+ * because the two callers disagree about what time it is: a new mint takes
+ * the full TTL from now, but rewriting an existing -- still current --
+ * record as part of migration must keep the expiry it was minted with, or
+ * every migration quietly extends the token's assumed life.
+ */
+static void save_cache_record(sfcc_client* c, time_t expires_at){
   if(c == NULL || c->no_cache || c->cache_path == NULL){
     return;
   }
@@ -142,20 +269,55 @@ void sfcc_auth_save_cache(sfcc_client* c){
   if(c->identity_url != NULL){
     cJSON_AddStringToObject(root, "identity_url", c->identity_url);
   }
-  const time_t now = time(NULL);
-  cJSON_AddNumberToObject(root, "issued_at", (double)now);
+  cJSON_AddNumberToObject(root, "issued_at", (double)time(NULL));
   /*
    * Written explicitly rather than left for the reader to infer. The TTL is an
    * assumption -- the platform does not advertise a lifetime for this flow -- and
    * putting the conclusion in the file makes that assumption visible to anyone
    * reading it, instead of buried in the arithmetic on the load path.
    */
-  cJSON_AddNumberToObject(root, "expires_at", (double)(now + SFCC_TOKEN_TTL));
+  cJSON_AddNumberToObject(root, "expires_at", (double)expires_at);
 
   char* text = cJSON_PrintUnformatted(root);
+  const size_t text_len = text ? strlen(text) : 0;
   cJSON_Delete(root);
   if(text == NULL){
     return;
+  }
+
+  /*
+   * Encrypted-or-nothing. With a passphrase set, the frame is what gets
+   * written and a failed wrap caches nothing -- it never falls back to
+   * plaintext, because "the protection this run promised" is not something a
+   * cache should be allowed to quietly withdraw. The failure is loud, on
+   * stderr, exactly because caching silently nothing turns into "why did
+   * this run re-authenticate" three runs later.
+   */
+  const char* passphrase = sfcc_cache_passphrase();
+  const unsigned char* payload = (const unsigned char*)text;
+  size_t payload_len = text_len;
+  sfcc_buf framed;
+  sfcc_buf_init(&framed);
+  if(passphrase != NULL){
+    if(!sfcc_cache_crypto_available()){
+      fprintf(stderr, "note: SFCC_CACHE_PASSPHRASE is set, but this build has "
+                      "no cache-encryption backend; the token was not cached "
+                      "(is libcrypto present at build time on this "
+                      "platform?)\n");
+      goto done_write;
+    }
+    int w = sfcc_cache_wrap(passphrase, payload, payload_len,
+                            kdf_iters_from_env(), &framed);
+    if(w != SFCC_CACHE_OK){
+      fprintf(stderr, "note: the token was not cached (%s)\n",
+              w == SFCC_CACHE_ERR_OUT_OF_MEMORY ? "out of memory"
+              : w == SFCC_CACHE_ERR_KDF_RANGE   ? "unusable "
+                                                "SFCC_CACHE_KDF_ITERS"
+                                                : "frame init failed");
+      goto done_write;
+    }
+    payload = (const unsigned char*)framed.data;
+    payload_len = framed.len;
   }
 
   /* Write to a temporary file and rename, so an interrupted run cannot leave a
@@ -165,7 +327,7 @@ void sfcc_auth_save_cache(sfcc_client* c){
   if(n > 0 && (size_t)n < sizeof(tmp)){
     FILE* f = fopen(tmp, "wb");
     if(f != NULL){
-      fputs(text, f);
+      fwrite(payload, 1, payload_len, f);
       fclose(f);
 #ifndef _WIN32
       /*
@@ -191,8 +353,14 @@ void sfcc_auth_save_cache(sfcc_client* c){
       }
     }
   }
+
+done_write:
+  sfcc_cache_zero(text, text_len);
   free(text);
+  sfcc_cache_zero(framed.data, framed.len);
+  sfcc_buf_free(&framed);
 }
+
 
 /* ------------------------------------------------------------------------ */
 /* Token request                                                            */

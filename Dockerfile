@@ -15,11 +15,15 @@ FROM alpine:3.24 AS build
 
 # build-base gives gcc/musl-dev/make. cmake builds the project; pkgconfig lets
 # it find libcurl; curl-dev is the headers and the shared library to link.
+# openssl-dev is the libcrypto headers and static library for the cache
+# encryption backend (curl-dev pulls it in transitively today; named here so
+# that dependency staying a fact is this file's job, not alpine's).
 RUN apk add --no-cache \
       build-base \
       cmake \
       pkgconf \
-      curl-dev
+      curl-dev \
+      openssl-dev
 
 WORKDIR /src
 

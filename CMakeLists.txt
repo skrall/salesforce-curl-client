@@ -141,10 +141,65 @@ add_library(sfcc STATIC
   src/sfcc_json.c
   src/sfcc_http.c
   src/sfcc_auth.c
+  src/sfcc_cache_crypto.c
   src/sfcc_client.c
   src/sfcc_deploy.c
   src/sfcc_rest.c
   src/sfcc_soap.c)
+
+# --- token-cache encryption -------------------------------------------------
+#
+# SFCC_CACHE_PASSPHRASE turns the cache file into an SFCCENC1 frame
+# (AES-256-GCM, key from PBKDF2-HMAC-SHA256; layout in sfcc_cache_crypto.c).
+# Its value depends entirely on the key not living on the same disk as the
+# ciphertext, which is why there is no key file and no --passphrase flag --
+# the same reasons secrets get their env-only rule generally.
+#
+# The backend, and with it the dependency picture, differs by platform:
+#
+#   Windows  CNG            in the OS, nothing to find or link but bcrypt
+#   macOS    OpenSSL        from Homebrew (see below for why not CommonCrypto)
+#   Linux    OpenSSL        POSIX has no standard crypto; libcrypto fills it
+#
+# OpenSSL is a real build-time requirement (headers and -lcrypto) on Linux and
+# macOS, but not a new runtime package in practice: on Linux libcurl, already
+# required, pulls libcrypto in on every distro that can run this binary at
+# all. On macOS the Homebrew libcurl this project already builds against
+# links libcrypto too, but the headers are keg-only, so macOS points CMake at
+# them with OPENSSL_ROOT_DIR=$(brew --prefix openssl@3).
+#
+# Why not CommonCrypto on macOS: the platform's GCM interface left the public
+# SDK headers entirely -- not deprecated, removed -- and the successor Apple
+# points at, corecrypto, ships in the SDK of the OS itself rather than in the
+# macOS SDK that command-line builds compile against. The first CI run of
+# this feature demonstrated both facts, per message. libcrypto it is.
+#
+# If none is found, the feature collapses to a no (everything reports
+# SFCC_ERR_CRYPTO_UNAVAILABLE, the cache layer refuses to encrypt and says so
+# on stderr) and the build stays green rather than broken. Docker and CI both
+# pass libcrypto-dependent libcurl packages today; the package names are
+# given where they are installed.
+if(WIN32)
+  set(SFCC_CACHE_CRYPTO_BACKEND "CNG")
+  target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_CNG)
+  # bcrypt.lib holds BCryptEncrypt/Decrypt/GenRandom for the AES-GCM and RNG
+  # primitives; PBKDF2 comes through the same header. advapi32 permissions
+  # are not involved here despite the name overlap with the old Crypt* API.
+  target_link_libraries(sfcc PUBLIC bcrypt)
+elseif(APPLE OR UNIX)
+  # One branch for both POSIX families: the macOS story above reduces to the
+  # same find_package, pointed at Homebrew's keg by OPENSSL_ROOT_DIR.
+  find_package(OpenSSL QUIET)
+  if(OpenSSL_FOUND)
+    set(SFCC_CACHE_CRYPTO_BACKEND "OpenSSL")
+    target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_OPENSSL)
+    target_link_libraries(sfcc PUBLIC OpenSSL::Crypto)
+  else()
+    set(SFCC_CACHE_CRYPTO_BACKEND "none")
+    target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_NONE)
+    message(STATUS "  cache encryption . none (install libssl-dev / openssl-devel on Linux, or OPENSSL_ROOT_DIR=$(brew --prefix openssl@3) on macOS)")
+  endif()
+endif()
 
 target_include_directories(sfcc
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -195,5 +250,6 @@ message(STATUS "")
 message(STATUS "  ${PROJECT_NAME} ${PROJECT_VERSION}")
 message(STATUS "  build type ....... ${CMAKE_BUILD_TYPE}")
 message(STATUS "  libcurl .......... ${CURL_VERSION_STRING}")
+message(STATUS "  cache crypto ..... ${SFCC_CACHE_CRYPTO_BACKEND}")
 message(STATUS "  executables ...... bin/sfcc")
 message(STATUS "")

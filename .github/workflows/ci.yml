@@ -43,8 +43,12 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # libssl-dev supplies the OpenSSL headers sfcc_cache_crypto.c links
+          # when the backend is OpenSSL. It is a build-time question only:
+          # libcurl, already required, pulls libcrypto in at runtime on every
+          # distro this can run on, so no new runtime package appears.
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libcurl4-openssl-dev
+            cmake ninja-build libcurl4-openssl-dev libssl-dev
 
       - name: Configure
         run: |
@@ -109,8 +113,12 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # libssl-dev supplies the OpenSSL headers sfcc_cache_crypto.c links
+          # when the backend is OpenSSL. It is a build-time question only:
+          # libcurl, already required, pulls libcrypto in at runtime on every
+          # distro this can run on, so no new runtime package appears.
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libcurl4-openssl-dev
+            cmake ninja-build libcurl4-openssl-dev libssl-dev
 
       - name: Build (release)
         run: |
@@ -133,14 +141,19 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install libcurl
-        run: brew install curl
+        # openssl@3 supplies the cache-encryption backend: CommonCrypto's own
+        # GCM interface has left the public SDK headers, and libcrypto is the
+        # one C-level primitive this project uses that macOS does not answer
+        # without a pinned, first-line build-time dependency.
+        run: brew install curl openssl@3
 
       - name: Configure
         run: |
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DSFCC_WERROR=ON \
-            -DCMAKE_PREFIX_PATH="$(brew --prefix curl)"
+            -DCMAKE_PREFIX_PATH="$(brew --prefix curl)" \
+            -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 
       - name: Build
         run: cmake --build build --parallel
