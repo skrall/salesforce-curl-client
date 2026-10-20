@@ -656,17 +656,43 @@ static void test_cache_crypto(void){
   /* -- frame round trip ---------------------------------------------------- */
   sfcc_buf frame;
   sfcc_buf_init(&frame);
-  check(sfcc_cache_wrap("key-one", PAYLOAD, PAYLOAD_LEN,
-                        SFCC_CACHE_KDF_MINIMUM, &frame) == SFCC_CACHE_OK,
-        "wrap succeeds");
-  check(frame.len == (size_t)(SFCC_CACHE_MAGIC_LEN   /* magic            */
-                            + 1                      /* version          */
-                            + 4                      /* iters            */
+  int w = sfcc_cache_wrap("key-one", PAYLOAD, PAYLOAD_LEN,
+                          SFCC_CACHE_KDF_MINIMUM, &frame);
+  if(w != SFCC_CACHE_OK){
+    /* A backend that will not run is the one bug this platform can hide
+     * from Linux entirely; the code is the only clue a CI log will carry. */
+    fprintf(stderr, "  diag: wrap rc=%d\n", w);
+  }
+  check(w == SFCC_CACHE_OK, "wrap succeeds");
+  check(frame.len == 0 || frame.data != NULL,
+        "a failed wrap leaves no half-buffer behind");
+  if(frame.len != (size_t)(SFCC_CACHE_MAGIC_LEN  /* magic            */
+                          + 1                    /* version          */
+                          + 4                    /* iters            */
+                          + SFCC_CACHE_SALT_LEN
+                          + SFCC_CACHE_NONCE_LEN
+                          + PAYLOAD_LEN
+                          + SFCC_CACHE_TAG_LEN)){
+    fprintf(stderr, "  diag: frame len=%d, want %d\n", (int)frame.len,
+            (int)(SFCC_CACHE_MAGIC_LEN + 5 + SFCC_CACHE_SALT_LEN +
+                  SFCC_CACHE_NONCE_LEN + PAYLOAD_LEN + SFCC_CACHE_TAG_LEN));
+  }
+  check(frame.len == (size_t)(SFCC_CACHE_MAGIC_LEN  /* magic            */
+                            + 1                     /* version          */
+                            + 4                     /* iters            */
                             + SFCC_CACHE_SALT_LEN
                             + SFCC_CACHE_NONCE_LEN
                             + PAYLOAD_LEN
                             + SFCC_CACHE_TAG_LEN),
         "frame length is header plus ciphertext plus tag");
+  if(frame.data == NULL){
+    /* Everything past this point reads the frame; without one, report the
+     * root cause and stop before a null-range memcmp says more. */
+    fprintf(stderr, "  no frame to test; skipping the rest of the group\n");
+    env_clear("SFCC_CACHE_PASSPHRASE");
+    env_clear("SFCC_CACHE_KDF_ITERS");
+    return;
+  }
   check(memcmp(frame.data, SFCC_CACHE_MAGIC, SFCC_CACHE_MAGIC_LEN) == 0,
         "the frame opens with the magic");
 
