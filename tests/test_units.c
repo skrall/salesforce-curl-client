@@ -808,12 +808,12 @@ static void test_cache_crypto(void){
   sfcc_config_defaults(&cfg);
   cfg.cache_path = CACHE;
 
-  sfcc_client* w = sfcc_client_new(&cfg);
-  if(w != NULL){
-    sfcc_strset(&w->access_token, "tok-encrypted-secret");
-    sfcc_strset(&w->instance_url, "http://127.0.0.1:65535/");
-    w->token_expiry = time(NULL) + 900;
-    sfcc_auth_save_cache(w);
+  sfcc_client* wm = sfcc_client_new(&cfg);
+  if(wm != NULL){
+    sfcc_strset(&wm->access_token, "tok-encrypted-secret");
+    sfcc_strset(&wm->instance_url, "http://127.0.0.1:65535/");
+    wm->token_expiry = time(NULL) + 900;
+    sfcc_auth_save_cache(wm);
 
     /* On disk: frame bytes, with no token anywhere in the plaintext, and a
      * header iteration count that honours the override. */
@@ -970,7 +970,7 @@ static void test_cache_crypto(void){
      * alone: the correct passphrase is one corrected environment variable
      * away, and deleting the frame here would take that away with it.
      */
-    sfcc_auth_save_cache(w);                       /* frame under the good phrase */
+    sfcc_auth_save_cache(wm);                      /* frame under the good phrase */
     env_set("SFCC_CACHE_PASSPHRASE", "someone-else's");
     sfcc_client* gate = sfcc_client_new(&cfg);
     if(gate != NULL){
@@ -997,7 +997,7 @@ static void test_cache_crypto(void){
     env_set("SFCC_CACHE_PASSPHRASE", "unit-game");
 
     remove(CACHE);
-    sfcc_client_free(w);
+    sfcc_client_free(wm);
   }else{
     check(0, "client constructs for the cache round trip");
   }
