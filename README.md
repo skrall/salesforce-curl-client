@@ -41,11 +41,14 @@ apt install libcurl4-openssl-dev build-essential cmake
 
 ### macOS
 
-libcurl is present but headers often are not:
+libcurl is present but headers often are not, and the cache-encryption
+backend needs libcrypto headers that are keg-only too:
 
 ```sh
-brew install curl cmake
-cmake -S . -B build -DCMAKE_PREFIX_PATH="$(brew --prefix curl)"
+brew install curl cmake openssl@3
+cmake -S . -B build \
+  -DCMAKE_PREFIX_PATH="$(brew --prefix curl)" \
+  -DOPENSSL_ROOT_DIR="$(brew --prefix openssl@3)"
 ```
 
 ### Windows
@@ -602,9 +605,9 @@ deliberately. Each is covered by a test.
   600000 iterations and is paid every time the cache is read;
   `SFCC_CACHE_KDF_ITERS` lowers it per machine, and the chosen count is
   recorded in the file header, so a lowered one is visible, not secret.
-  Windows and macOS get the crypto from the OS (CNG and CommonCrypto);
-  on Linux it links libcrypto, which is present wherever libcurl is, so no
-  extra package is needed at runtime.
+  Windows gets the crypto from the OS (CNG); on Linux and macOS it links
+  libcrypto — present wherever libcurl is on Linux, and `brew install
+  openssl@3` on macOS, so no new runtime package in practice.
 
 * **Redirects are not followed.** Following one would replay the
   `Authorization` header at whatever host the `Location` points to.

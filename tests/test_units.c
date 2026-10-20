@@ -624,7 +624,7 @@ static void env_clear(const char* var){
  * The encrypted cache frame, and what the auth layer does with it.
  *
  * Everything here runs on whatever backend the build selected, which is the
- * point: the same test list exercises OpenSSL, CNG, or CommonCrypto purely by
+ * point: the same test list exercises OpenSSL or CNG purely by
  * virtue of being built on the platform, and a Windows run of these checks
  * is real coverage of BCrypt's GCM rather than a placeholder.
  */

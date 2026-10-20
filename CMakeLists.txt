@@ -158,14 +158,21 @@ add_library(sfcc STATIC
 # The backend, and with it the dependency picture, differs by platform:
 #
 #   Windows  CNG            in the OS, nothing to find or link but bcrypt
-#   macOS    CommonCrypto   in the OS, nothing to find or link
+#   macOS    OpenSSL        from Homebrew (see below for why not CommonCrypto)
 #   Linux    OpenSSL        POSIX has no standard crypto; libcrypto fills it
 #
-# Linux is a real build-time requirement (headers and -lcrypto), but not a
-# new runtime package in practice: libcurl, already required, pulls libcrypto
-# in on every distro that can run this binary at all. That is also why the
-# requirement is worded as a package-name comment below rather than a
-# vendored tree.
+# OpenSSL is a real build-time requirement (headers and -lcrypto) on Linux and
+# macOS, but not a new runtime package in practice: on Linux libcurl, already
+# required, pulls libcrypto in on every distro that can run this binary at
+# all. On macOS the Homebrew libcurl this project already builds against
+# links libcrypto too, but the headers are keg-only, so macOS points CMake at
+# them with OPENSSL_ROOT_DIR=$(brew --prefix openssl@3).
+#
+# Why not CommonCrypto on macOS: the platform's GCM interface left the public
+# SDK headers entirely -- not deprecated, removed -- and the successor Apple
+# points at, corecrypto, ships in the SDK of the OS itself rather than in the
+# macOS SDK that command-line builds compile against. The first CI run of
+# this feature demonstrated both facts, per message. libcrypto it is.
 #
 # If none is found, the feature collapses to a no (everything reports
 # SFCC_ERR_CRYPTO_UNAVAILABLE, the cache layer refuses to encrypt and says so
@@ -179,14 +186,9 @@ if(WIN32)
   # primitives; PBKDF2 comes through the same header. advapi32 permissions
   # are not involved here despite the name overlap with the old Crypt* API.
   target_link_libraries(sfcc PUBLIC bcrypt)
-elseif(APPLE)
-  set(SFCC_CACHE_CRYPTO_BACKEND "corecrypto/CommonCrypto")
-  target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_CC)
-  # CommonCrypto supplies KDF and RNG from libSystem. The raw GCM primitive
-  # lives in corecrypto, a separate dylib the SDK headers describe -- see the
-  # note in sfcc_cache_crypto.c about why not CommonCrypto's own GCM calls.
-  target_link_libraries(sfcc PUBLIC corecrypto)
-else()
+elseif(APPLE OR UNIX)
+  # One branch for both POSIX families: the macOS story above reduces to the
+  # same find_package, pointed at Homebrew's keg by OPENSSL_ROOT_DIR.
   find_package(OpenSSL QUIET)
   if(OpenSSL_FOUND)
     set(SFCC_CACHE_CRYPTO_BACKEND "OpenSSL")
@@ -195,7 +197,7 @@ else()
   else()
     set(SFCC_CACHE_CRYPTO_BACKEND "none")
     target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_NONE)
-    message(STATUS "  cache encryption . none (install libssl-dev / openssl-devel for it)")
+    message(STATUS "  cache encryption . none (install libssl-dev / openssl-devel on Linux, or OPENSSL_ROOT_DIR=$(brew --prefix openssl@3) on macOS)")
   endif()
 endif()
 
