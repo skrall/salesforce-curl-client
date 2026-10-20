@@ -96,7 +96,8 @@ class Client:
         # outcome of a run, and the mock's fake credentials are used instead.
         for var in ("SFCC_CLIENT_ID", "SFCC_CLIENT_SECRET",
                     "SFCC_ACCESS_TOKEN", "SFCC_INSTANCE_URL",
-                    "SFCC_TOKEN_CACHE"):
+                    "SFCC_TOKEN_CACHE",
+                    "SFCC_CACHE_PASSPHRASE", "SFCC_CACHE_KDF_ITERS"):
             self.env.pop(var, None)
         self.env["SFCC_CLIENT_ID"] = MOCK_CLIENT_ID
         self.env["SFCC_CLIENT_SECRET"] = MOCK_SECRET
@@ -324,6 +325,98 @@ def test_token_refresh(c, r):
     r.contains(blob, "INVALID_SESSION_ID", "and names the org's reason")
     r.lacks(blob, "no credentials",
             "rather than pretending the credentials are missing")
+
+
+def test_encrypted_cache(c, r):
+    """SFCC_CACHE_PASSPHRASE: the file at rest, reads back, refusals, migration."""
+
+    # Every run in here shares one passphrase and one cache path; the
+    # subprocess env is rebuilt from c.env each time, so a section that pops
+    # the passphrase out cannot leak into the next one.
+    PHRASE = "e2e-passphrase-one"
+    path = c.path_in("encrypted-token.json")
+
+    def cli(*args, env_overrides=None):
+        env = dict(c.env)
+        env["SFCC_TOKEN_CACHE"] = path
+        if env_overrides:
+            env.update(env_overrides)
+        for var, value in list(env.items()):
+            if value is None:
+                env.pop(var)
+        return subprocess.run([c.path, "--login-url", c.login_url] + list(args),
+                              capture_output=True, text=True, env=env,
+                              cwd=c.workdir, timeout=60)
+
+    def read_bytes(path):
+        with open(path, "rb") as fh:
+            return fh.read()
+
+    MAGIC = b"SFCCENC1"
+    with_phrase = {"SFCC_CACHE_PASSPHRASE": PHRASE}
+    wrong_phrase = {"SFCC_CACHE_PASSPHRASE": "e2e-passphrase-two"}
+
+    r.section("cache: setting the passphrase encrypts the file at rest")
+    proc = cli("auth", env_overrides=with_phrase)
+    r.check(proc.returncode == 0, "auth with passphrase exits 0",
+            proc.stderr.strip()[:200])
+    blob = read_bytes(path)
+    r.check(blob.startswith(MAGIC), "the cache is an SFCCENC1 frame",
+            blob[:8])
+    r.lacks(blob.decode("latin-1"), "access_token",
+            "the plaintext key does not appear anywhere in it")
+    import stat as _stat
+    mode = _stat.S_IMODE(os.stat(path).st_mode)
+    r.check(mode == 0o600, "the frame is still owner-only, 0600", oct(mode))
+
+    r.section("cache: the same passphrase reads it back without a new grant")
+    before = MOCK.token_grants
+    proc = cli("rest", "echo", env_overrides=with_phrase)
+    r.check(proc.returncode == 0, "the command succeeds", proc.stderr[:200])
+    r.check(MOCK.token_grants == before,
+            "and decrypted straight into a working request, no re-mint",
+            "%d -> %d" % (before, MOCK.token_grants))
+
+    r.section("cache: the wrong passphrase is refused, not guessed around")
+    proc = cli("rest", "echo", env_overrides=wrong_phrase)
+    blob = proc.stdout + proc.stderr
+    r.check(proc.returncode != 0, "exits nonzero")
+    r.contains(blob, "SFCC_CACHE_PASSPHRASE", "the message names the variable")
+    r.check(read_bytes(path).startswith(MAGIC),
+            "and the file was left alone, not deleted and reminted over")
+
+    r.section("cache: no passphrase refuses with the instruction")
+    proc = cli("rest", "echo", env_overrides={"SFCC_CACHE_PASSPHRASE": None})
+    blob = proc.stdout + proc.stderr
+    r.check(proc.returncode != 0, "exits nonzero")
+    r.contains(blob, "set SFCC_CACHE_PASSPHRASE", "and says what to set")
+
+    r.section("cache: a plaintext cache is migrated at the next read")
+    seed_cache(c, MOCK_TOKEN, c.login_url, 1800)
+    if os.path.exists(path):
+        os.remove(path)
+    os.rename(c.path_in("token.json"), path)
+    before = MOCK.token_grants
+    proc = cli("rest", "echo", env_overrides=with_phrase)
+    r.check(proc.returncode == 0, "the plaintext cache still works",
+            proc.stderr[:200])
+    r.check(MOCK.token_grants == before,
+            "without minting, because the seeded token was fresh",
+            "%d -> %d" % (before, MOCK.token_grants))
+    blob = read_bytes(path)
+    r.check(blob.startswith(MAGIC), "and the file is now encrypted")
+    r.lacks(blob.decode("latin-1"), "access_token", "with no plaintext left")
+
+    r.section("cache: a corrupted frame is refused cleanly")
+    blob = bytearray(read_bytes(path))
+    blob[60] ^= 0x01
+    with open(path, "wb") as fh:
+        fh.write(bytes(blob))
+    proc = cli("rest", "echo", env_overrides=with_phrase)
+    blobout = proc.stdout + proc.stderr
+    r.check(proc.returncode != 0, "exits nonzero")
+    r.contains(blobout, "wrong passphrase or a corrupt file",
+               "and does not pretend to know which of the two")
 
 
 def test_query(c, r):
@@ -1073,7 +1166,7 @@ def test_transport_errors(c, r):
 
 # --------------------------------------------------------------------------
 
-ALL = [test_auth, test_token_refresh, test_query, test_sobjects, test_describe, test_retrieve,
+ALL = [test_auth, test_token_refresh, test_encrypted_cache, test_query, test_sobjects, test_describe, test_retrieve,
        test_records,
        test_validation, test_rest,
        test_binary_output, test_stdio, test_deploy, test_transport_errors]

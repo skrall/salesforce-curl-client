@@ -141,10 +141,61 @@ add_library(sfcc STATIC
   src/sfcc_json.c
   src/sfcc_http.c
   src/sfcc_auth.c
+  src/sfcc_cache_crypto.c
   src/sfcc_client.c
   src/sfcc_deploy.c
   src/sfcc_rest.c
   src/sfcc_soap.c)
+
+# --- token-cache encryption -------------------------------------------------
+#
+# SFCC_CACHE_PASSPHRASE turns the cache file into an SFCCENC1 frame
+# (AES-256-GCM, key from PBKDF2-HMAC-SHA256; layout in sfcc_cache_crypto.c).
+# Its value depends entirely on the key not living on the same disk as the
+# ciphertext, which is why there is no key file and no --passphrase flag --
+# the same reasons secrets get their env-only rule generally.
+#
+# The backend, and with it the dependency picture, differs by platform:
+#
+#   Windows  CNG            in the OS, nothing to find or link but bcrypt
+#   macOS    CommonCrypto   in the OS, nothing to find or link
+#   Linux    OpenSSL        POSIX has no standard crypto; libcrypto fills it
+#
+# Linux is a real build-time requirement (headers and -lcrypto), but not a
+# new runtime package in practice: libcurl, already required, pulls libcrypto
+# in on every distro that can run this binary at all. That is also why the
+# requirement is worded as a package-name comment below rather than a
+# vendored tree.
+#
+# If none is found, the feature collapses to a no (everything reports
+# SFCC_ERR_CRYPTO_UNAVAILABLE, the cache layer refuses to encrypt and says so
+# on stderr) and the build stays green rather than broken. Docker and CI both
+# pass libcrypto-dependent libcurl packages today; the package names are
+# given where they are installed.
+if(WIN32)
+  set(SFCC_CACHE_CRYPTO_BACKEND "CNG")
+  target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_CNG)
+  # bcrypt.lib holds BCryptEncrypt/Decrypt/GenRandom for the AES-GCM and RNG
+  # primitives; PBKDF2 comes through the same header. advapi32 permissions
+  # are not involved here despite the name overlap with the old Crypt* API.
+  target_link_libraries(sfcc PUBLIC bcrypt)
+elseif(APPLE)
+  set(SFCC_CACHE_CRYPTO_BACKEND "CommonCrypto")
+  target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_CC)
+  # CommonCrypto lives in libSystem, so there is no explicit link; see the
+  # deprecation note in sfcc_cache_crypto.c about the GCM interface.
+else()
+  find_package(OpenSSL QUIET)
+  if(OpenSSL_FOUND)
+    set(SFCC_CACHE_CRYPTO_BACKEND "OpenSSL")
+    target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_OPENSSL)
+    target_link_libraries(sfcc PUBLIC OpenSSL::Crypto)
+  else()
+    set(SFCC_CACHE_CRYPTO_BACKEND "none")
+    target_compile_definitions(sfcc PRIVATE SFCC_CRYPTO_BACKEND_NONE)
+    message(STATUS "  cache encryption . none (install libssl-dev / openssl-devel for it)")
+  endif()
+endif()
 
 target_include_directories(sfcc
   PUBLIC  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -195,5 +246,6 @@ message(STATUS "")
 message(STATUS "  ${PROJECT_NAME} ${PROJECT_VERSION}")
 message(STATUS "  build type ....... ${CMAKE_BUILD_TYPE}")
 message(STATUS "  libcurl .......... ${CURL_VERSION_STRING}")
+message(STATUS "  cache crypto ..... ${SFCC_CACHE_CRYPTO_BACKEND}")
 message(STATUS "  executables ...... bin/sfcc")
 message(STATUS "")

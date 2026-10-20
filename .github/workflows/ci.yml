@@ -43,8 +43,12 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # libssl-dev supplies the OpenSSL headers sfcc_cache_crypto.c links
+          # when the backend is OpenSSL. It is a build-time question only:
+          # libcurl, already required, pulls libcrypto in at runtime on every
+          # distro this can run on, so no new runtime package appears.
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libcurl4-openssl-dev
+            cmake ninja-build libcurl4-openssl-dev libssl-dev
 
       - name: Configure
         run: |
@@ -109,8 +113,12 @@ jobs:
       - name: Install build dependencies
         run: |
           sudo apt-get update
+          # libssl-dev supplies the OpenSSL headers sfcc_cache_crypto.c links
+          # when the backend is OpenSSL. It is a build-time question only:
+          # libcurl, already required, pulls libcrypto in at runtime on every
+          # distro this can run on, so no new runtime package appears.
           sudo apt-get install -y --no-install-recommends \
-            cmake ninja-build libcurl4-openssl-dev
+            cmake ninja-build libcurl4-openssl-dev libssl-dev
 
       - name: Build (release)
         run: |

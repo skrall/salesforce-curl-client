@@ -97,6 +97,70 @@ void sfcc_progress_report(sfcc_progress* p, const char* op, const char* id,
                           long interval_s);
 void sfcc_progress_finish(sfcc_progress* p);
 
+/* ------------------------------------------------------------------------ */
+/* Encrypted token-cache frame                                               */
+/* ------------------------------------------------------------------------ */
+
+/*
+ * When SFCC_CACHE_PASSPHRASE is set, the cache file is written as an
+ * SFCCENC1 frame instead of JSON: AES-256-GCM over the record, with the key
+ * from PBKDF2-HMAC-SHA256. See src/sfcc_cache_crypto.c for the byte layout
+ * and the reasoning about which threat this answers; sfcc_auth.c decides
+ * when to wrap and what an unwrap failure means for the run.
+ *
+ * Every failure leaves the *out buffer empty and allocated-free -- never
+ * with a partial frame in it -- so a caller can treat both functions as
+ * all-or-nothing.
+ */
+#define SFCC_CACHE_MAGIC "SFCCENC1"
+#define SFCC_CACHE_MAGIC_LEN 8
+#define SFCC_CACHE_FORMAT_VERSION 1
+#define SFCC_CACHE_SALT_LEN 16
+#define SFCC_CACHE_NONCE_LEN 12
+#define SFCC_CACHE_TAG_LEN 16
+#define SFCC_CACHE_KEY_LEN 32          /* AES-256                            */
+
+/* The KDF is where passphrase strength is bought, so the default tracks
+ * published guidance rather than a round number. It can be lowered per
+ * machine with SFCC_CACHE_KDF_ITERS -- the file records the count that
+ * produced it, so a lowered one is visible, not secret. Both writers and
+ * readers bound the value; a reader refuses a header outside this range
+ * outright, which turns the field from a compute-scale attack into plain
+ * corruption. */
+#define SFCC_CACHE_KDF_DEFAULT 600000UL
+#define SFCC_CACHE_KDF_MINIMUM 1000UL
+#define SFCC_CACHE_KDF_MAXIMUM 100000000UL
+
+typedef enum {
+  SFCC_CACHE_OK = 0,
+  SFCC_CACHE_ERR_ARG = -1,             /* caller bug                      */
+  SFCC_CACHE_ERR_CRYPTO_UNAVAILABLE = -2,  /* built without a backend     */
+  SFCC_CACHE_ERR_NO_PASSPHRASE = -3,   /* set SFCC_CACHE_PASSPHRASE       */
+  SFCC_CACHE_ERR_OUT_OF_MEMORY = -4,
+  SFCC_CACHE_ERR_KDF_RANGE = -5,       /* clamp before calling            */
+  SFCC_CACHE_ERR_NOT_OURS = -6,        /* no SFCCENC1 magic               */
+  SFCC_CACHE_ERR_BAD_HEADER = -7,      /* ours, but corrupted or newer    */
+  SFCC_CACHE_ERR_KEY_MISMATCH = -8,    /* tag check failed                */
+} sfcc_cache_rc;
+
+const char* sfcc_cache_passphrase(void);
+int sfcc_cache_crypto_available(void);
+
+/* Wrap `pt_len` bytes into an SFCCENC1 frame appended to `out`, or fail with
+ * one of the codes above. `iters` must already be inside
+ * [SFCC_CACHE_KDF_MINIMUM, SFCC_CACHE_KDF_MAXIMUM]. */
+int sfcc_cache_wrap(const char* passphrase, const unsigned char* plaintext,
+                    size_t pt_len, unsigned long iters, sfcc_buf* out);
+
+/* Reverse. Header rejects are distinct from decrypt rejects: they are
+ * decided before the KDF runs and cost microseconds, where a KEY_MISMATCH
+ * has paid the full derivation first. */
+int sfcc_cache_unwrap(const char* passphrase, const unsigned char* frame,
+                      size_t frame_len, sfcc_buf* out);
+
+/* Zero memory that held key material or the plaintext, before it is freed. */
+void sfcc_cache_zero(void* p, size_t n);
+
 /* Strings and paths                                                        */
 /* ------------------------------------------------------------------------ */
 

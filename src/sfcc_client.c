@@ -293,7 +293,22 @@ sfcc_status sfcc_ensure_auth(sfcc_client* c){
   if(sfcc_token_is_fresh(c)){
     return SFCC_OK;
   }
-  (void)sfcc_auth_load_cache(c);
+  /*
+   * The cache refusing to be read is not the same as there being no cache.
+   * A file that exists but cannot be opened -- JSON that does not parse, an
+   * SFCCENC1 frame no passphrase will open -- is treated as a hard failure
+   * carrying load_cache's message, because the alternative is what the void
+   * below used to say: mint a fresh token and rename it over the file.
+   * Against a plaintext cache that was merely annoying to debug; against an
+   * encrypted one it would destroy data that a correct passphrase typed one
+   * environment later would have opened. The messages name the file and the
+   * way out, which is what makes the refusal acceptable rather than merely
+   * loud.
+   */
+  sfcc_status rc = sfcc_auth_load_cache(c);
+  if(rc != SFCC_OK){
+    return rc;
+  }
   if(sfcc_token_is_fresh(c)){
     return SFCC_OK;
   }
