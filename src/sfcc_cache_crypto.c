@@ -209,11 +209,13 @@ static int backend_derive_key(const char* pass, size_t pass_len,
                               size_t key_len){
   BCRYPT_ALG_HANDLE h = NULL;
   int rc = -1;
-  /* CNG carries PBKDF2 through a hash provider: PBKDF2 with SHA-256 is
-   * requested by opening the SHA-256 algorithm and passing it as the PRF,
-   * which is the same construction PKCS#5 spells out on paper. */
+  /* CNG carries PBKDF2 through the hash-algorithm provider, and the provider
+   * must be opened with the HMAC flag: PBKDF2's PRF *is* HMAC-SHA-256, and
+   * without the flag the derive call refuses -- which once cost a CI run to
+   * find, the error having been invisible until the stages were named. */
   if(NT_SUCCESS(BCryptOpenAlgorithmProvider(&h, BCRYPT_SHA256_ALGORITHM,
-                                            NULL, 0)) &&
+                                            NULL,
+                                            BCRYPT_ALG_HANDLE_HMAC_FLAG)) &&
      NT_SUCCESS(BCryptDeriveKeyPBKDF2(h, (PUCHAR)pass, (ULONG)pass_len,
                                       (PUCHAR)salt, (ULONG)salt_len,
                                       (ULONGLONG)iters, key,
