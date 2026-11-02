@@ -194,7 +194,7 @@ jobs:
       # in the file, and a floating tag resolves to whatever the tag points at on
       # the day the job runs.
       - name: Set up CMake
-        uses: lukka/get-cmake@v4.4.4
+        uses: lukka/get-cmake@v4.4.5
         with:
           cmakeVersion: '>=3.21'
 
